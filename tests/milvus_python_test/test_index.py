@@ -1,47 +1,548 @@
-"""
-   For testing index operations, including `create_index`, `describe_index` and `drop_index` interfaces
-"""
 import logging
-import pytest
 import time
 import pdb
 import threading
 from multiprocessing import Pool, Process
 import numpy
+import pytest
 import sklearn.preprocessing
-from milvus import Milvus, IndexType, MetricType
 from utils import *
 
-nb = 10000
+nb = 6000
 dim = 128
 index_file_size = 10
-vectors = gen_vectors(nb, dim)
-vectors = sklearn.preprocessing.normalize(vectors, axis=1, norm='l2')
-vectors = vectors.tolist()
-BUILD_TIMEOUT = 60
+BUILD_TIMEOUT = 300
 nprobe = 1
+top_k = 5
+tag = "1970-01-01"
+NLIST = 4046
+INVALID_NLIST = 100000000
+field_name = "float_vector"
+binary_field_name = "binary_vector"
+collection_id = "index"
+default_index_type = "FLAT"
+entity = gen_entities(1)
+entities = gen_entities(nb)
+raw_vector, binary_entity = gen_binary_entities(1)
+raw_vectors, binary_entities = gen_binary_entities(nb)
+query, query_vecs = gen_query_vectors(field_name, entities, top_k, 1)
+default_index = {"index_type": "IVF_FLAT", "params": {"nlist": 1024}, "metric_type": "L2"}
 
 
 class TestIndexBase:
     @pytest.fixture(
         scope="function",
-        params=gen_index_params()
+        params=gen_simple_index()
     )
-    def get_index_params(self, request, args):
-        if "internal" not in args:
-            if request.param["index_type"] == IndexType.IVF_SQ8H:
-                pytest.skip("sq8h not support in open source")
+    def get_simple_index(self, request, connect):
+        logging.getLogger().info(request.param)
+        if str(connect._cmd("mode")) == "CPU":
+            if request.param["index_type"] in index_cpu_not_support():
+                pytest.skip("sq8h not support in CPU mode")
         return request.param
 
     @pytest.fixture(
         scope="function",
-        params=gen_simple_index_params()
+        params=[
+            1,
+            10,
+            1500
+        ],
     )
-    def get_simple_index_params(self, request, args):
-        if "internal" not in args:
-            if request.param["index_type"] == IndexType.IVF_SQ8H:
-                pytest.skip("sq8h not support in open source")
+    def get_nq(self, request):
+        yield request.param
+
+    """
+    ******************************************************************
+      The following cases are used to test `create_index` function
+    ******************************************************************
+    """
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        ids = connect.insert(collection, entities)
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_no_vectors(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_partition(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection, create partition, and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_partition(collection, tag)
+        ids = connect.insert(collection, entities, partition_tag=tag)
+        connect.flush([collection])
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_partition_flush(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection, create partition, and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_partition(collection, tag)
+        ids = connect.insert(collection, entities, partition_tag=tag)
+        connect.flush()
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.level(2)
+    def test_create_index_without_connect(self, dis_connect, collection):
+        '''
+        target: test create index without connection
+        method: create collection and add entities in it, check if added successfully
+        expected: raise exception
+        '''
+        with pytest.raises(Exception) as e:
+            dis_connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_search_with_query_vectors(self, connect, collection, get_simple_index, get_nq):
+        '''
+        target: test create index interface, search with more query vectors
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        ids = connect.insert(collection, entities)
+        connect.create_index(collection, field_name, get_simple_index)
+        logging.getLogger().info(connect.get_collection_stats(collection))
+        nq = get_nq
+        index_type = get_simple_index["index_type"]
+        search_param = get_search_param(index_type)
+        query, vecs = gen_query_vectors(field_name, entities, top_k, nq, search_params=search_param)
+        res = connect.search(collection, query)
+        assert len(res) == nq
+
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    @pytest.mark.level(2)
+    def test_create_index_multithread(self, connect, collection, args):
+        '''
+        target: test create index interface with multiprocess
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        ids = connect.insert(collection, entities)
+
+        def build(connect):
+            connect.create_index(collection, field_name, default_index)
+
+        threads_num = 8
+        threads = []
+        for i in range(threads_num):
+            m = get_milvus(host=args["ip"], port=args["port"], handler=args["handler"])
+            t = threading.Thread(target=build, args=(m,))
+            threads.append(t)
+            t.start()
+            time.sleep(0.2)
+        for t in threads:
+            t.join()
+
+    @pytest.mark.level(2)
+    def test_create_index_collection_not_existed(self, connect):
+        '''
+        target: test create index interface when collection name not existed
+        method: create collection and add entities in it, create index
+            , make sure the collection name not in index
+        expected: return code not equals to 0, create index failed
+        '''
+        collection_name = gen_unique_str(collection_id)
+        with pytest.raises(Exception) as e:
+            connect.create_index(collection, field_name, default_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_no_vectors_insert(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface when there is no vectors in collection, and does not affect the subsequent process
+        method: create collection and add no vectors in it, and then create index, add entities in it
+        expected: return code equals to 0
+        '''
+        connect.create_index(collection, field_name, get_simple_index)
+        ids = connect.insert(collection, entities)
+        connect.flush([collection])
+        count = connect.count_entities(collection)
+        assert count == nb
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_same_index_repeatedly(self, connect, collection, get_simple_index):
+        '''
+        target: check if index can be created repeatedly, with the same create_index params
+        method: create index after index have been built
+        expected: return code success, and search ok
+        '''
+        connect.create_index(collection, field_name, get_simple_index)
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_different_index_repeatedly(self, connect, collection):
+        '''
+        target: check if index can be created repeatedly, with the different create_index params
+        method: create another index with different index_params after index have been built
+        expected: return code 0, and describe index result equals with the second index params
+        '''
+        ids = connect.insert(collection, entities)
+        indexs = [default_index, {"index_type": "FLAT", "nlist": 1024}]
+        for index in indexs:
+            connect.create_index(collection, field_name, index)
+            stats = connect.get_collection_stats(collection)
+            assert stats["partitions"][0]["segments"][0]["index_name"] == index["index_type"]
+            assert stats["row_count"] == nb
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        ids = connect.insert(collection, entities)
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_no_vectors_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_partition_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection, create partition, and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_partition(collection, tag)
+        ids = connect.insert(collection, entities, partition_tag=tag)
+        connect.flush([collection])
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_partition_flush_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface
+        method: create collection, create partition, and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_partition(collection, tag)
+        ids = connect.insert(collection, entities, partition_tag=tag)
+        connect.flush()
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_search_with_query_vectors_ip(self, connect, collection, get_simple_index, get_nq):
+        '''
+        target: test create index interface, search with more query vectors
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        metric_type = "IP"
+        ids = connect.insert(collection, entities)
+        get_simple_index["metric_type"] = metric_type
+        connect.create_index(collection, field_name, get_simple_index)
+        logging.getLogger().info(connect.get_collection_stats(collection))
+        nq = get_nq
+        index_type = get_simple_index["index_type"]
+        search_param = get_search_param(index_type)
+        query, vecs = gen_query_vectors(field_name, entities, top_k, nq, metric_type=metric_type, search_params=search_param)
+        res = connect.search(collection, query)
+        assert len(res) == nq
+
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    @pytest.mark.level(2)
+    def test_create_index_multithread_ip(self, connect, collection, args):
+        '''
+        target: test create index interface with multiprocess
+        method: create collection and add entities in it, create index
+        expected: return search success
+        '''
+        ids = connect.insert(collection, entities)
+
+        def build(connect):
+            default_index["metric_type"] = "IP"
+            connect.create_index(collection, field_name, default_index)
+
+        threads_num = 8
+        threads = []
+        for i in range(threads_num):
+            m = get_milvus(host=args["ip"], port=args["port"], handler=args["handler"])
+            t = threading.Thread(target=build, args=(m,))
+            threads.append(t)
+            t.start()
+            time.sleep(0.2)
+        for t in threads:
+            t.join()
+
+    # TODO
+    @pytest.mark.level(2)
+    def test_create_index_collection_not_existed_ip(self, connect, collection):
+        '''
+        target: test create index interface when collection name not existed
+        method: create collection and add entities in it, create index
+            , make sure the collection name not in index
+        expected: return code not equals to 0, create index failed
+        '''
+        collection_name = gen_unique_str(collection_id)
+        default_index["metric_type"] = "IP"
+        with pytest.raises(Exception) as e:
+            connect.create_index(collection, field_name, default_index)
+
+    # TODO
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_index_no_vectors_insert_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create index interface when there is no vectors in collection, and does not affect the subsequent process
+        method: create collection and add no vectors in it, and then create index, add entities in it
+        expected: return code equals to 0
+        '''
+        default_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+        ids = connect.insert(collection, entities)
+        connect.flush([collection])
+        count = connect.count_entities(collection)
+        assert count == nb
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_same_index_repeatedly_ip(self, connect, collection, get_simple_index):
+        '''
+        target: check if index can be created repeatedly, with the same create_index params
+        method: create index after index have been built
+        expected: return code success, and search ok
+        '''
+        default_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+        connect.create_index(collection, field_name, get_simple_index)
+
+    @pytest.mark.level(2)
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def test_create_different_index_repeatedly_ip(self, connect, collection):
+        '''
+        target: check if index can be created repeatedly, with the different create_index params
+        method: create another index with different index_params after index have been built
+        expected: return code 0, and describe index result equals with the second index params
+        '''
+        ids = connect.insert(collection, entities)
+        indexs = [default_index, {"index_type": "FLAT", "params": {"nlist": 1024}, "metric_type": "IP"}]
+        for index in indexs:
+            connect.create_index(collection, field_name, index)
+            stats = connect.get_collection_stats(collection)
+            assert stats["partitions"][0]["segments"][0]["index_name"] == index["index_type"]
+            assert stats["row_count"] == nb
+
+    """
+    ******************************************************************
+      The following cases are used to test `drop_index` function
+    ******************************************************************
+    """
+
+    @pytest.mark.level(2)
+    def test_drop_index(self, connect, collection, get_simple_index):
+        '''
+        target: test drop index interface
+        method: create collection and add entities in it, create index, call drop index
+        expected: return code 0, and default index param
+        '''
+        # ids = connect.insert(collection, entities)
+        connect.create_index(collection, field_name, get_simple_index)
+        connect.drop_index(collection, field_name)
+        stats = connect.get_collection_stats(collection)
+        # assert stats["partitions"][0]["segments"][0]["index_name"] == default_index_type
+        assert not stats["partitions"][0]["segments"]
+
+    @pytest.mark.level(2)
+    def test_drop_index_repeatly(self, connect, collection, get_simple_index):
+        '''
+        target: test drop index repeatly
+        method: create index, call drop index, and drop again
+        expected: return code 0
+        '''
+        connect.create_index(collection, field_name, get_simple_index)
+        stats = connect.get_collection_stats(collection)
+        connect.drop_index(collection, field_name)
+        connect.drop_index(collection, field_name)
+        stats = connect.get_collection_stats(collection)
+        logging.getLogger().info(stats)
+        # assert stats["partitions"][0]["segments"][0]["index_name"] == default_index_type
+        assert not stats["partitions"][0]["segments"]
+
+    @pytest.mark.level(2)
+    def test_drop_index_without_connect(self, dis_connect, collection):
+        '''
+        target: test drop index without connection
+        method: drop index, and check if drop successfully
+        expected: raise exception
+        '''
+        with pytest.raises(Exception) as e:
+            dis_connect.drop_index(collection, field_name)
+
+    @pytest.mark.level(2)
+    def test_drop_index_collection_not_existed(self, connect):
+        '''
+        target: test drop index interface when collection name not existed
+        method: create collection and add entities in it, create index
+            , make sure the collection name not in index, and then drop it
+        expected: return code not equals to 0, drop index failed
+        '''
+        collection_name = gen_unique_str(collection_id)
+        with pytest.raises(Exception) as e:
+            connect.drop_index(collection_name, field_name)
+
+    @pytest.mark.level(2)
+    def test_drop_index_collection_not_create(self, connect, collection):
+        '''
+        target: test drop index interface when index not created
+        method: create collection and add entities in it, create index
+        expected: return code not equals to 0, drop index failed
+        '''
+        # ids = connect.insert(collection, entities)
+        # no create index
+        connect.drop_index(collection, field_name)
+
+    @pytest.mark.level(2)
+    def test_create_drop_index_repeatly(self, connect, collection, get_simple_index):
+        '''
+        target: test create / drop index repeatly, use the same index params
+        method: create index, drop index, four times
+        expected: return code 0
+        '''
+        for i in range(4):
+            connect.create_index(collection, field_name, get_simple_index)
+            connect.drop_index(collection, field_name)
+
+    @pytest.mark.level(2)
+    def test_drop_index_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test drop index interface
+        method: create collection and add entities in it, create index, call drop index
+        expected: return code 0, and default index param
+        '''
+        # ids = connect.insert(collection, entities)
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+        connect.drop_index(collection, field_name)
+        stats = connect.get_collection_stats(collection)
+        # assert stats["partitions"][0]["segments"][0]["index_name"] == default_index_type
+        assert not stats["partitions"][0]["segments"]
+
+    @pytest.mark.level(2)
+    def test_drop_index_repeatly_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test drop index repeatly
+        method: create index, call drop index, and drop again
+        expected: return code 0
+        '''
+        get_simple_index["metric_type"] = "IP"
+        connect.create_index(collection, field_name, get_simple_index)
+        stats = connect.get_collection_stats(collection)
+        connect.drop_index(collection, field_name)
+        connect.drop_index(collection, field_name)
+        stats = connect.get_collection_stats(collection)
+        logging.getLogger().info(stats)
+        # assert stats["partitions"][0]["segments"][0]["index_name"] == default_index_type
+        assert not stats["partitions"][0]["segments"]
+
+    @pytest.mark.level(2)
+    def test_drop_index_without_connect_ip(self, dis_connect, collection):
+        '''
+        target: test drop index without connection
+        method: drop index, and check if drop successfully
+        expected: raise exception
+        '''
+        with pytest.raises(Exception) as e:
+            dis_connect.drop_index(collection, field_name)
+
+    @pytest.mark.level(2)
+    def test_drop_index_collection_not_create_ip(self, connect, collection):
+        '''
+        target: test drop index interface when index not created
+        method: create collection and add entities in it, create index
+        expected: return code not equals to 0, drop index failed
+        '''
+        # ids = connect.insert(collection, entities)
+        # no create index
+        connect.drop_index(collection, field_name)
+
+    @pytest.mark.level(2)
+    def test_create_drop_index_repeatly_ip(self, connect, collection, get_simple_index):
+        '''
+        target: test create / drop index repeatly, use the same index params
+        method: create index, drop index, four times
+        expected: return code 0
+        '''
+        get_simple_index["metric_type"] = "IP"
+        for i in range(4):
+            connect.create_index(collection, field_name, get_simple_index)
+            connect.drop_index(collection, field_name)
+
+
+class TestIndexBinary:
+    @pytest.fixture(
+        scope="function",
+        params=gen_simple_index()
+    )
+    def get_simple_index(self, request, connect):
+        if str(connect._cmd("mode")) == "CPU":
+            if request.param["index_type"] in index_cpu_not_support():
+                pytest.skip("sq8h not support in CPU mode")
         return request.param
+
+    @pytest.fixture(
+        scope="function",
+        params=gen_simple_index()
+    )
+    def get_jaccard_index(self, request, connect):
+        if request.param["index_type"] in binary_support():
+            request.param["metric_type"] = "JACCARD"
+            return request.param
+        else:
+            pytest.skip("Skip index")
+
+    @pytest.fixture(
+        scope="function",
+        params=[
+            1,
+            10,
+            1500
+        ],
+    )
+    def get_nq(self, request):
+        yield request.param
 
     """
     ******************************************************************
@@ -50,331 +551,80 @@ class TestIndexBase:
     """
 
     @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index(self, connect, table, get_index_params):
+    def test_create_index(self, connect, binary_collection, get_jaccard_index):
         '''
         target: test create index interface
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
+        method: create collection and add entities in it, create index
+        expected: return search success
         '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(table, vectors)
-        status = connect.create_index(table, index_params)
-        assert status.OK()
-
-    @pytest.mark.level(2)
-    def test_create_index_without_connect(self, dis_connect, table):
-        '''
-        target: test create index without connection
-        method: create table and add vectors in it, check if added successfully
-        expected: raise exception
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        with pytest.raises(Exception) as e:
-            status = dis_connect.create_index(table, index_param)
+        ids = connect.insert(binary_collection, binary_entities)
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
 
     @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index_search_with_query_vectors(self, connect, table, get_index_params):
+    def test_create_index_partition(self, connect, binary_collection, get_jaccard_index):
+        '''
+        target: test create index interface
+        method: create collection, create partition, and add entities in it, create index
+        expected: return search success
+        '''
+        connect.create_partition(binary_collection, tag)
+        ids = connect.insert(binary_collection, binary_entities, partition_tag=tag)
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+
+    # TODO:
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def _test_create_index_search_with_query_vectors(self, connect, binary_collection, get_jaccard_index, get_nq):
         '''
         target: test create index interface, search with more query vectors
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
+        method: create collection and add entities in it, create index
+        expected: return search success
         '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(table, vectors)
-        status = connect.create_index(table, index_params)
-        logging.getLogger().info(connect.describe_index(table))
-        query_vecs = [vectors[0], vectors[1], vectors[2]]
-        top_k = 5
-        status, result = connect.search_vectors(table, top_k, nprobe, query_vecs)
-        assert status.OK()
-        assert len(result) == len(query_vecs)
-        logging.getLogger().info(result)
-
-    # TODO: enable
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    @pytest.mark.level(2)
-    def _test_create_index_multiprocessing(self, connect, table, args):
-        '''
-        target: test create index interface with multiprocess
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
-        '''
-        status, ids = connect.add_vectors(table, vectors)
-
-        def build(connect):
-            status = connect.create_index(table)
-            assert status.OK()
-
-        process_num = 8
-        processes = []
-        uri = "tcp://%s:%s" % (args["ip"], args["port"])
-
-        for i in range(process_num):
-            m = Milvus()
-            m.connect(uri=uri)
-            p = Process(target=build, args=(m,))
-            processes.append(p)
-            p.start()
-            time.sleep(0.2)
-        for p in processes:
-            p.join()
-
-        query_vec = [vectors[0]]
-        top_k = 1
-        status, result = connect.search_vectors(table, top_k, nprobe, query_vec)
-        assert len(result) == 1
-        assert len(result[0]) == top_k
-        assert result[0][0].distance == 0.0
-
-    # TODO: enable
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def _test_create_index_multiprocessing_multitable(self, connect, args):
-        '''
-        target: test create index interface with multiprocess
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
-        '''
-        process_num = 8
-        loop_num = 8
-        processes = []
-
-        table = []
-        j = 0
-        while j < (process_num*loop_num):
-            table_name = gen_unique_str("test_create_index_multiprocessing")
-            table.append(table_name)
-            param = {'table_name': table_name,
-                    'dimension': dim,
-                    'index_type': IndexType.FLAT,
-                    'store_raw_vector': False}
-            connect.create_table(param)
-            j = j + 1
-
-        def create_index():
-            i = 0
-            while i < loop_num:
-                # assert connect.has_table(table[ids*process_num+i])
-                status, ids = connect.add_vectors(table[ids*process_num+i], vectors)
-
-                status = connect.create_index(table[ids*process_num+i])
-                assert status.OK()
-                query_vec = [vectors[0]]
-                top_k = 1
-                status, result = connect.search_vectors(table[ids*process_num+i], top_k, nprobe, query_vec)
-                assert len(result) == 1
-                assert len(result[0]) == top_k
-                assert result[0][0].distance == 0.0
-                i = i + 1
-
-        uri = "tcp://%s:%s" % (args["ip"], args["port"])
-
-        for i in range(process_num):
-            m = Milvus()
-            m.connect(uri=uri)
-            ids = i
-            p = Process(target=create_index, args=(m,ids))
-            processes.append(p)
-            p.start()
-            time.sleep(0.2)
-        for p in processes:
-            p.join()
-
-    def test_create_index_table_not_existed(self, connect):
-        '''
-        target: test create index interface when table name not existed
-        method: create table and add vectors in it, create index
-            , make sure the table name not in index
-        expected: return code not equals to 0, create index failed
-        '''
-        table_name = gen_unique_str(self.__class__.__name__)
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status = connect.create_index(table_name, index_param)
-        assert not status.OK()
-
-    def test_create_index_table_None(self, connect):
-        '''
-        target: test create index interface when table name is None
-        method: create table and add vectors in it, create index with an table_name: None
-        expected: return code not equals to 0, create index failed
-        '''
-        table_name = None
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        with pytest.raises(Exception) as e:
-            status = connect.create_index(table_name, index_param)
-
-    def test_create_index_no_vectors(self, connect, table):
-        '''
-        target: test create index interface when there is no vectors in table
-        method: create table and add no vectors in it, and then create index
-        expected: return code equals to 0
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status = connect.create_index(table, index_param)
-        assert status.OK()
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index_no_vectors_then_add_vectors(self, connect, table, get_simple_index_params):
-        '''
-        target: test create index interface when there is no vectors in table, and does not affect the subsequent process
-        method: create table and add no vectors in it, and then create index, add vectors in it
-        expected: return code equals to 0
-        '''
-        index_param = get_simple_index_params
-        status = connect.create_index(table, index_param)
-        status, ids = connect.add_vectors(table, vectors)
-        assert status.OK()
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_same_index_repeatedly(self, connect, table, get_simple_index_params):
-        '''
-        target: check if index can be created repeatedly, with the same create_index params
-        method: create index after index have been built
-        expected: return code success, and search ok
-        '''
-        status, ids = connect.add_vectors(table, vectors)
-        index_param = get_simple_index_params
-        status = connect.create_index(table, index_param)
-        status = connect.create_index(table, index_param)
-        assert status.OK()
-        query_vec = [vectors[0]]
-        top_k = 1
-        status, result = connect.search_vectors(table, top_k, nprobe, query_vec)
-        assert len(result) == 1
-        assert len(result[0]) == top_k
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_different_index_repeatedly(self, connect, table):
-        '''
-        target: check if index can be created repeatedly, with the different create_index params
-        method: create another index with different index_params after index have been built
-        expected: return code 0, and describe index result equals with the second index params
-        '''
-        nlist = 16384
-        status, ids = connect.add_vectors(table, vectors)
-        index_type_1 = IndexType.IVF_SQ8
-        index_type_2 = IndexType.IVFLAT
-        index_params = [{"index_type": index_type_1, "nlist": nlist}, {"index_type": index_type_2, "nlist": nlist}]
-        logging.getLogger().info(index_params)
-        for index_param in index_params:
-            status = connect.create_index(table, index_param)
-            assert status.OK()
-        status, result = connect.describe_index(table)
-        assert result._nlist == nlist
-        assert result._table_name == table
-        assert result._index_type == index_type_2
+        nq = get_nq
+        pdb.set_trace()
+        ids = connect.insert(binary_collection, binary_entities)
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+        query, vecs = gen_query_vectors(binary_field_name, binary_entities, top_k, nq)
+        search_param = get_search_param(binary_collection["index_type"])
+        res = connect.search(binary_collection, query, search_params=search_param)
+        logging.getLogger().info(res)
+        assert len(res) == nq
 
     """
     ******************************************************************
-      The following cases are used to test `describe_index` function
+      The following cases are used to test `get_index_info` function
     ******************************************************************
     """
 
-    def test_describe_index(self, connect, table, get_index_params):
+    def test_get_index_info(self, connect, binary_collection, get_jaccard_index):
         '''
         target: test describe index interface
-        method: create table and add vectors in it, create index, call describe index
+        method: create collection and add entities in it, create index, call describe index
         expected: return code 0, and index instructure
         '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(table, vectors)
-        status = connect.create_index(table, index_params)
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        assert result._nlist == index_params["nlist"]
-        assert result._table_name == table
-        assert result._index_type == index_params["index_type"]
+        if get_jaccard_index["index_type"] == "BIN_FLAT":
+            pytest.skip("GetCollectionStats skip BIN_FLAT")
+        ids = connect.insert(binary_collection, binary_entities)
+        connect.flush([binary_collection])
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+        stats = connect.get_collection_stats(binary_collection)
+        logging.getLogger().info(stats)
+        assert stats['partitions'][0]['segments'][0]['index_name'] == get_jaccard_index['index_type']
 
-    def test_describe_and_drop_index_multi_tables(self, connect, get_simple_index_params):
+    def test_get_index_info_partition(self, connect, binary_collection, get_jaccard_index):
         '''
-        target: test create, describe and drop index interface with multiple tables of L2
-        method: create tables and add vectors in it, create index, call describe index
+        target: test describe index interface
+        method: create collection, create partition and add entities in it, create index, call describe index
         expected: return code 0, and index instructure
         '''
-        nq = 100
-        vectors = gen_vectors(nq, dim)
-        table_list = []
-        for i in range(10):
-            table_name = gen_unique_str()
-            table_list.append(table_name)
-            param = {'table_name': table_name,
-                     'dimension': dim,
-                     'index_file_size': index_file_size,
-                     'metric_type': MetricType.L2}
-            connect.create_table(param)
-            index_params = get_simple_index_params
-            logging.getLogger().info(index_params)
-            status, ids = connect.add_vectors(table_name=table_name, records=vectors)
-            status = connect.create_index(table_name, index_params)
-            assert status.OK()
-
-        for i in range(10):
-            status, result = connect.describe_index(table_list[i])
-            logging.getLogger().info(result)
-            assert result._nlist == index_params["nlist"]
-            assert result._table_name == table_list[i]
-            assert result._index_type == index_params["index_type"]
-
-        for i in range(10):
-            status = connect.drop_index(table_list[i])
-            assert status.OK()
-            status, result = connect.describe_index(table_list[i])
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == table_list[i]
-            assert result._index_type == IndexType.FLAT
-
-    @pytest.mark.level(2)
-    def test_describe_index_without_connect(self, dis_connect, table):
-        '''
-        target: test describe index without connection
-        method: describe index, and check if describe successfully
-        expected: raise exception
-        '''
-        with pytest.raises(Exception) as e:
-            status = dis_connect.describe_index(table)
-
-    def test_describe_index_table_not_existed(self, connect):
-        '''
-        target: test describe index interface when table name not existed
-        method: create table and add vectors in it, create index
-            , make sure the table name not in index
-        expected: return code not equals to 0, describe index failed
-        '''
-        table_name = gen_unique_str(self.__class__.__name__)
-        status, result = connect.describe_index(table_name)
-        assert not status.OK()
-
-    def test_describe_index_table_None(self, connect):
-        '''
-        target: test describe index interface when table name is None
-        method: create table and add vectors in it, create index with an table_name: None
-        expected: return code not equals to 0, describe index failed
-        '''
-        table_name = None
-        with pytest.raises(Exception) as e:
-            status = connect.describe_index(table_name)
-
-    def test_describe_index_not_create(self, connect, table):
-        '''
-        target: test describe index interface when index not created
-        method: create table and add vectors in it, create index
-            , make sure the table name not in index
-        expected: return code not equals to 0, describe index failed
-        '''
-        status, ids = connect.add_vectors(table, vectors)
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        assert status.OK()
-        # assert result._nlist == index_params["nlist"]
-        # assert result._table_name == table
-        # assert result._index_type == index_params["index_type"]
+        if get_jaccard_index["index_type"] == "BIN_FLAT":
+            pytest.skip("GetCollectionStats skip BIN_FLAT")
+        connect.create_partition(binary_collection, tag)
+        ids = connect.insert(binary_collection, binary_entities, partition_tag=tag)
+        connect.flush([binary_collection])
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+        stats = connect.get_collection_stats(binary_collection)
+        logging.getLogger().info(stats)
+        assert stats['partitions'][1]['segments'][0]['index_name'] == get_jaccard_index['index_type']
 
     """
     ******************************************************************
@@ -382,625 +632,196 @@ class TestIndexBase:
     ******************************************************************
     """
 
-    def test_drop_index(self, connect, table, get_index_params):
+    def test_drop_index(self, connect, binary_collection, get_jaccard_index):
         '''
         target: test drop index interface
-        method: create table and add vectors in it, create index, call drop index
+        method: create collection and add entities in it, create index, call drop index
         expected: return code 0, and default index param
         '''
-        index_param = get_index_params
-        status, ids = connect.add_vectors(table, vectors)
-        status = connect.create_index(table, index_param)
-        assert status.OK()
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        status = connect.drop_index(table)
-        assert status.OK()
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        assert result._nlist == 16384
-        assert result._table_name == table
-        assert result._index_type == IndexType.FLAT
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+        stats = connect.get_collection_stats(binary_collection)
+        logging.getLogger().info(stats)
+        connect.drop_index(binary_collection, binary_field_name)
+        stats = connect.get_collection_stats(binary_collection)
+        # assert stats["partitions"][0]["segments"][0]["index_name"] == default_index_type
+        assert not stats["partitions"][0]["segments"]
 
-    def test_drop_index_repeatly(self, connect, table, get_index_params):
+    def test_drop_index_partition(self, connect, binary_collection, get_jaccard_index):
         '''
-        target: test drop index repeatly
-        method: create index, call drop index, and drop again
-        expected: return code 0
+        target: test drop index interface
+        method: create collection, create partition and add entities in it, create index on collection, call drop collection index
+        expected: return code 0, and default index param
         '''
-        index_param = get_index_params
-        status, ids = connect.add_vectors(table, vectors)
-        status = connect.create_index(table, index_param)
-        assert status.OK()
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        status = connect.drop_index(table)
-        assert status.OK()
-        status = connect.drop_index(table)
-        assert status.OK()
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        assert result._nlist == 16384
-        assert result._table_name == table
-        assert result._index_type == IndexType.FLAT
+        connect.create_partition(binary_collection, tag)
+        ids = connect.insert(binary_collection, binary_entities, partition_tag=tag)
+        connect.flush([binary_collection])
+        connect.create_index(binary_collection, binary_field_name, get_jaccard_index)
+        stats = connect.get_collection_stats(binary_collection)
+        logging.getLogger().info(stats)
+        connect.drop_index(binary_collection, binary_field_name)
+        stats = connect.get_collection_stats(binary_collection)
+        logging.getLogger().info(stats)
+        assert stats["partitions"][1]["segments"][0]["index_name"] == default_index_type
+
+
+class TestIndexMultiCollections(object):
 
     @pytest.mark.level(2)
-    def test_drop_index_without_connect(self, dis_connect, table):
+    @pytest.mark.timeout(BUILD_TIMEOUT)
+    def _test_create_index_multithread_multicollection(self, connect, args):
         '''
-        target: test drop index without connection
-        method: drop index, and check if drop successfully
-        expected: raise exception
+        target: test create index interface with multiprocess
+        method: create collection and add entities in it, create index
+        expected: return search success
         '''
-        with pytest.raises(Exception) as e:
-            status = dis_connect.drop_index(table)
+        threads_num = 8
+        loop_num = 8
+        threads = []
+        collection = []
+        j = 0
+        while j < (threads_num * loop_num):
+            collection_name = gen_unique_str("test_create_index_multiprocessing")
+            collection.append(collection_name)
+            param = {'collection_name': collection_name,
+                     'dimension': dim,
+                     'index_type': IndexType.FLAT,
+                     'store_raw_vector': False}
+            connect.create_collection(param)
+            j = j + 1
 
-    def test_drop_index_table_not_existed(self, connect):
-        '''
-        target: test drop index interface when table name not existed
-        method: create table and add vectors in it, create index
-            , make sure the table name not in index, and then drop it
-        expected: return code not equals to 0, drop index failed
-        '''
-        table_name = gen_unique_str(self.__class__.__name__)
-        status = connect.drop_index(table_name)
-        assert not status.OK()
+        def create_index():
+            i = 0
+            while i < loop_num:
+                # assert connect.has_collection(collection[ids*process_num+i])
+                ids = connect.insert(collection[ids * threads_num + i], vectors)
+                connect.create_index(collection[ids * threads_num + i], IndexType.IVFLAT, {"nlist": NLIST, "metric_type": "L2"})
+                assert status.OK()
+                query_vec = [vectors[0]]
+                top_k = 1
+                search_param = {"nprobe": nprobe}
+                status, result = connect.search(collection[ids * threads_num + i], top_k, query_vec,
+                                                params=search_param)
+                assert len(result) == 1
+                assert len(result[0]) == top_k
+                assert result[0][0].distance == 0.0
+                i = i + 1
 
-    def test_drop_index_table_None(self, connect):
-        '''
-        target: test drop index interface when table name is None
-        method: create table and add vectors in it, create index with an table_name: None
-        expected: return code not equals to 0, drop index failed
-        '''
-        table_name = None
-        with pytest.raises(Exception) as e:
-            status = connect.drop_index(table_name)
-
-    def test_drop_index_table_not_create(self, connect, table):
-        '''
-        target: test drop index interface when index not created
-        method: create table and add vectors in it, create index
-        expected: return code not equals to 0, drop index failed
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status, ids = connect.add_vectors(table, vectors)
-        status, result = connect.describe_index(table)
-        logging.getLogger().info(result)
-        # no create index
-        status = connect.drop_index(table)
-        logging.getLogger().info(status)
-        assert status.OK()
-
-    def test_create_drop_index_repeatly(self, connect, table, get_simple_index_params):
-        '''
-        target: test create / drop index repeatly, use the same index params
-        method: create index, drop index, four times
-        expected: return code 0
-        '''
-        index_params = get_simple_index_params
-        status, ids = connect.add_vectors(table, vectors)
-        for i in range(2):
-            status = connect.create_index(table, index_params)
-            assert status.OK()
-            status, result = connect.describe_index(table)
-            logging.getLogger().info(result)
-            status = connect.drop_index(table)
-            assert status.OK()
-            status, result = connect.describe_index(table)
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == table
-            assert result._index_type == IndexType.FLAT
-
-    def test_create_drop_index_repeatly_different_index_params(self, connect, table):
-        '''
-        target: test create / drop index repeatly, use the different index params
-        method: create index, drop index, four times, each tme use different index_params to create index
-        expected: return code 0
-        '''
-        nlist = 16384
-        index_params = [{"index_type": IndexType.IVFLAT, "nlist": nlist}, {"index_type": IndexType.IVF_SQ8, "nlist": nlist}]
-        status, ids = connect.add_vectors(table, vectors)
-        for i in range(2):
-            status = connect.create_index(table, index_params[i])
-            assert status.OK()
-            status, result = connect.describe_index(table)
-            logging.getLogger().info(result)
-            status = connect.drop_index(table)
-            assert status.OK()
-            status, result = connect.describe_index(table)
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == table
-            assert result._index_type == IndexType.FLAT
+        for i in range(threads_num):
+            m = get_milvus(host=args["ip"], port=args["port"], handler=args["handler"])
+            ids = i
+            t = threading.Thread(target=create_index, args=(m, ids))
+            threads.append(t)
+            t.start()
+            time.sleep(0.2)
+        for t in threads:
+            t.join()
 
 
-class TestIndexIP:
-    @pytest.fixture(
-        scope="function",
-        params=gen_index_params()
-    )
-    def get_index_params(self, request, args):
-        if "internal" not in args:
-            if request.param["index_type"] == IndexType.IVF_SQ8H:
-                pytest.skip("sq8h not support in open source")
-        return request.param
+class TestIndexInvalid(object):
+    """
+    Test create / describe / drop index interfaces with invalid collection names
+    """
 
     @pytest.fixture(
         scope="function",
-        params=gen_simple_index_params()
+        params=gen_invalid_strs()
     )
-    def get_simple_index_params(self, request, args):
-        if "internal" not in args:
-            if request.param["index_type"] == IndexType.IVF_SQ8H:
-                pytest.skip("sq8h not support in open source")
-        return request.param
+    def get_collection_name(self, request):
+        yield request.param
+
+    @pytest.mark.level(1)
+    def test_create_index_with_invalid_collectionname(self, connect, get_collection_name):
+        collection_name = get_collection_name
+        with pytest.raises(Exception) as e:
+            connect.create_index(collection_name, field_name, default_index)
+
+    @pytest.mark.level(1)
+    def test_drop_index_with_invalid_collectionname(self, connect, get_collection_name):
+        collection_name = get_collection_name
+        with pytest.raises(Exception) as e:
+            connect.drop_index(collection_name)
+
+    @pytest.fixture(
+        scope="function",
+        params=gen_invalid_index()
+    )
+    def get_index(self, request):
+        yield request.param
+
+    @pytest.mark.level(1)
+    def test_create_index_with_invalid_index_params(self, connect, collection, get_index):
+        logging.getLogger().info(get_index)
+        with pytest.raises(Exception) as e:
+            connect.create_index(collection, field_name, get_simple_index)
+
+
+class TestIndexAsync:
+    @pytest.fixture(scope="function", autouse=True)
+    def skip_http_check(self, args):
+        if args["handler"] == "HTTP":
+            pytest.skip("skip in http mode")
 
     """
     ******************************************************************
       The following cases are used to test `create_index` function
     ******************************************************************
     """
+
+    @pytest.fixture(
+        scope="function",
+        params=gen_simple_index()
+    )
+    def get_simple_index(self, request, connect):
+        if str(connect._cmd("mode")) == "CPU":
+            if request.param["index_type"] in index_cpu_not_support():
+                pytest.skip("sq8h not support in CPU mode")
+        return request.param
+
+    def check_result(self, res):
+        logging.getLogger().info("In callback check search result")
+        logging.getLogger().info(res)
+
+    """
+    ******************************************************************
+      The following cases are used to test `create_index` function
+    ******************************************************************
+    """
+
     @pytest.mark.level(2)
     @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index(self, connect, ip_table, get_index_params):
+    def test_create_index(self, connect, collection, get_simple_index):
         '''
         target: test create index interface
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
+        method: create collection and add entities in it, create index
+        expected: return search success
         '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status = connect.create_index(ip_table, index_params)
-        assert status.OK()
+        ids = connect.insert(collection, entities)
+        logging.getLogger().info("start index")
+        future = connect.create_index(collection, field_name, get_simple_index, _async=True)
+        logging.getLogger().info("before result")
+        res = future.result()
+        # TODO:
+        logging.getLogger().info(res)
 
-    @pytest.mark.level(2)
-    def test_create_index_without_connect(self, dis_connect, ip_table):
-        '''
-        target: test create index without connection
-        method: create table and add vectors in it, check if added successfully
-        expected: raise exception
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
+    def test_create_index_with_invalid_collectionname(self, connect):
+        collection_name = " "
+        future = connect.create_index(collection_name, field_name, default_index, _async=True)
         with pytest.raises(Exception) as e:
-            status = dis_connect.create_index(ip_table, index_param)
+            res = future.result()
 
+    @pytest.mark.level(2)
     @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index_search_with_query_vectors(self, connect, ip_table, get_index_params):
+    def test_create_index_callback(self, connect, collection, get_simple_index):
         '''
-        target: test create index interface, search with more query vectors
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
+        target: test create index interface
+        method: create collection and add entities in it, create index
+        expected: return search success
         '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status = connect.create_index(ip_table, index_params)
-        assert status.OK()
-        logging.getLogger().info(connect.describe_index(ip_table))
-        query_vecs = [vectors[0], vectors[1], vectors[2]]
-        top_k = 5
-        status, result = connect.search_vectors(ip_table, top_k, nprobe, query_vecs)
-        assert status.OK()
-        assert len(result) == len(query_vecs)
-        # logging.getLogger().info(result)
-
-    # TODO: enable
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    @pytest.mark.level(2)
-    def _test_create_index_multiprocessing(self, connect, ip_table, args):
-        '''
-        target: test create index interface with multiprocess
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
-        '''
-        status, ids = connect.add_vectors(ip_table, vectors)
-
-        def build(connect):
-            status = connect.create_index(ip_table)
-            assert status.OK()
-
-        process_num = 8
-        processes = []
-        uri = "tcp://%s:%s" % (args["ip"], args["port"])
-
-        for i in range(process_num):
-            m = Milvus()
-            m.connect(uri=uri)
-            p = Process(target=build, args=(m,))
-            processes.append(p)
-            p.start()
-            time.sleep(0.2)
-        for p in processes:
-            p.join()
-
-        query_vec = [vectors[0]]
-        top_k = 1
-        status, result = connect.search_vectors(ip_table, top_k, nprobe, query_vec)
-        assert len(result) == 1
-        assert len(result[0]) == top_k
-        assert result[0][0].distance == 0.0
-
-    # TODO: enable
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def _test_create_index_multiprocessing_multitable(self, connect, args):
-        '''
-        target: test create index interface with multiprocess
-        method: create table and add vectors in it, create index
-        expected: return code equals to 0, and search success
-        '''
-        process_num = 8
-        loop_num = 8
-        processes = []
-
-        table = []
-        j = 0
-        while j < (process_num*loop_num):
-            table_name = gen_unique_str("test_create_index_multiprocessing")
-            table.append(table_name)
-            param = {'table_name': table_name,
-                    'dimension': dim}
-            connect.create_table(param)
-            j = j + 1
-
-        def create_index():
-            i = 0
-            while i < loop_num:
-                # assert connect.has_table(table[ids*process_num+i])
-                status, ids = connect.add_vectors(table[ids*process_num+i], vectors)
-
-                status = connect.create_index(table[ids*process_num+i])
-                assert status.OK()
-                query_vec = [vectors[0]]
-                top_k = 1
-                status, result = connect.search_vectors(table[ids*process_num+i], top_k, nprobe, query_vec)
-                assert len(result) == 1
-                assert len(result[0]) == top_k
-                assert result[0][0].distance == 0.0
-                i = i + 1
-
-        uri = "tcp://%s:%s" % (args["ip"], args["port"])
-
-        for i in range(process_num):
-            m = Milvus()
-            m.connect(uri=uri)
-            ids = i
-            p = Process(target=create_index, args=(m,ids))
-            processes.append(p)
-            p.start()
-            time.sleep(0.2)
-        for p in processes:
-            p.join()
-
-    def test_create_index_no_vectors(self, connect, ip_table):
-        '''
-        target: test create index interface when there is no vectors in table
-        method: create table and add no vectors in it, and then create index
-        expected: return code equals to 0
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status = connect.create_index(ip_table, index_param)
-        assert status.OK()
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_index_no_vectors_then_add_vectors(self, connect, ip_table, get_simple_index_params):
-        '''
-        target: test create index interface when there is no vectors in table, and does not affect the subsequent process
-        method: create table and add no vectors in it, and then create index, add vectors in it
-        expected: return code equals to 0
-        '''
-        index_param = get_simple_index_params
-        status = connect.create_index(ip_table, index_param)
-        status, ids = connect.add_vectors(ip_table, vectors)
-        assert status.OK()
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_same_index_repeatedly(self, connect, ip_table):
-        '''
-        target: check if index can be created repeatedly, with the same create_index params
-        method: create index after index have been built
-        expected: return code success, and search ok
-        '''
-        nlist = 16384
-        status, ids = connect.add_vectors(ip_table, vectors)
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status = connect.create_index(ip_table, index_param)
-        status = connect.create_index(ip_table, index_param)
-        assert status.OK()
-        query_vec = [vectors[0]]
-        top_k = 1
-        status, result = connect.search_vectors(ip_table, top_k, nprobe, query_vec)
-        assert len(result) == 1
-        assert len(result[0]) == top_k
-
-    @pytest.mark.timeout(BUILD_TIMEOUT)
-    def test_create_different_index_repeatedly(self, connect, ip_table):
-        '''
-        target: check if index can be created repeatedly, with the different create_index params
-        method: create another index with different index_params after index have been built
-        expected: return code 0, and describe index result equals with the second index params
-        '''
-        nlist = 16384
-        status, ids = connect.add_vectors(ip_table, vectors)
-        index_type_1 = IndexType.IVF_SQ8
-        index_type_2 = IndexType.IVFLAT
-        index_params = [{"index_type": index_type_1, "nlist": nlist}, {"index_type": index_type_2, "nlist": nlist}]
-        logging.getLogger().info(index_params)
-        for index_param in index_params:
-            status = connect.create_index(ip_table, index_param)
-            assert status.OK()
-        status, result = connect.describe_index(ip_table)
-        assert result._nlist == nlist
-        assert result._table_name == ip_table
-        assert result._index_type == index_type_2
-
-    """
-    ******************************************************************
-      The following cases are used to test `describe_index` function
-    ******************************************************************
-    """
-
-    def test_describe_index(self, connect, ip_table, get_index_params):
-        '''
-        target: test describe index interface
-        method: create table and add vectors in it, create index, call describe index
-        expected: return code 0, and index instructure
-        '''
-        index_params = get_index_params
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status = connect.create_index(ip_table, index_params)
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        assert result._nlist == index_params["nlist"]
-        assert result._table_name == ip_table
-        assert result._index_type == index_params["index_type"]
-
-    def test_describe_and_drop_index_multi_tables(self, connect, get_simple_index_params):
-        '''
-        target: test create, describe and drop index interface with multiple tables of IP
-        method: create tables and add vectors in it, create index, call describe index
-        expected: return code 0, and index instructure
-        '''
-        nq = 100
-        vectors = gen_vectors(nq, dim)
-        table_list = []
-        for i in range(10):
-            table_name = gen_unique_str()
-            table_list.append(table_name)
-            param = {'table_name': table_name,
-                     'dimension': dim,
-                     'index_file_size': index_file_size,
-                     'metric_type': MetricType.IP}
-            connect.create_table(param)
-            index_params = get_simple_index_params
-            logging.getLogger().info(index_params)
-            status, ids = connect.add_vectors(table_name=table_name, records=vectors)
-            status = connect.create_index(table_name, index_params)
-            assert status.OK()
-
-        for i in range(10):
-            status, result = connect.describe_index(table_list[i])
-            logging.getLogger().info(result)
-            assert result._nlist == index_params["nlist"]
-            assert result._table_name == table_list[i]
-            assert result._index_type == index_params["index_type"]
-
-        for i in range(10):
-            status = connect.drop_index(table_list[i])
-            assert status.OK()
-            status, result = connect.describe_index(table_list[i])
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == table_list[i]
-            assert result._index_type == IndexType.FLAT
-
-    @pytest.mark.level(2)
-    def test_describe_index_without_connect(self, dis_connect, ip_table):
-        '''
-        target: test describe index without connection
-        method: describe index, and check if describe successfully
-        expected: raise exception
-        '''
-        with pytest.raises(Exception) as e:
-            status = dis_connect.describe_index(ip_table)
-
-    def test_describe_index_not_create(self, connect, ip_table):
-        '''
-        target: test describe index interface when index not created
-        method: create table and add vectors in it, create index
-            , make sure the table name not in index
-        expected: return code not equals to 0, describe index failed
-        '''
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        assert status.OK()
-        # assert result._nlist == index_params["nlist"]
-        # assert result._table_name == table
-        # assert result._index_type == index_params["index_type"]
-
-    """
-    ******************************************************************
-      The following cases are used to test `drop_index` function
-    ******************************************************************
-    """
-
-    def test_drop_index(self, connect, ip_table, get_index_params):
-        '''
-        target: test drop index interface
-        method: create table and add vectors in it, create index, call drop index
-        expected: return code 0, and default index param
-        '''
-        index_params = get_index_params
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status = connect.create_index(ip_table, index_params)
-        assert status.OK()
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        status = connect.drop_index(ip_table)
-        assert status.OK()
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        assert result._nlist == 16384
-        assert result._table_name == ip_table
-        assert result._index_type == IndexType.FLAT
-
-    def test_drop_index_repeatly(self, connect, ip_table, get_simple_index_params):
-        '''
-        target: test drop index repeatly
-        method: create index, call drop index, and drop again
-        expected: return code 0
-        '''
-        index_params = get_simple_index_params
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status = connect.create_index(ip_table, index_params)
-        assert status.OK()
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        status = connect.drop_index(ip_table)
-        assert status.OK()
-        status = connect.drop_index(ip_table)
-        assert status.OK()
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        assert result._nlist == 16384
-        assert result._table_name == ip_table
-        assert result._index_type == IndexType.FLAT
-
-    @pytest.mark.level(2)
-    def test_drop_index_without_connect(self, dis_connect, ip_table):
-        '''
-        target: test drop index without connection
-        method: drop index, and check if drop successfully
-        expected: raise exception
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVFLAT, "nlist": nlist}
-        with pytest.raises(Exception) as e:
-            status = dis_connect.drop_index(ip_table, index_param)
-
-    def test_drop_index_table_not_create(self, connect, ip_table):
-        '''
-        target: test drop index interface when index not created
-        method: create table and add vectors in it, create index
-        expected: return code not equals to 0, drop index failed
-        '''
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        logging.getLogger().info(index_param)
-        status, ids = connect.add_vectors(ip_table, vectors)
-        status, result = connect.describe_index(ip_table)
-        logging.getLogger().info(result)
-        # no create index
-        status = connect.drop_index(ip_table)
-        logging.getLogger().info(status)
-        assert status.OK()
-
-    def test_create_drop_index_repeatly(self, connect, ip_table, get_simple_index_params):
-        '''
-        target: test create / drop index repeatly, use the same index params
-        method: create index, drop index, four times
-        expected: return code 0
-        '''
-        index_params = get_simple_index_params
-        status, ids = connect.add_vectors(ip_table, vectors)
-        for i in range(2):
-            status = connect.create_index(ip_table, index_params)
-            assert status.OK()
-            status, result = connect.describe_index(ip_table)
-            logging.getLogger().info(result)
-            status = connect.drop_index(ip_table)
-            assert status.OK()
-            status, result = connect.describe_index(ip_table)
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == ip_table
-            assert result._index_type == IndexType.FLAT
-
-    def test_create_drop_index_repeatly_different_index_params(self, connect, ip_table):
-        '''
-        target: test create / drop index repeatly, use the different index params
-        method: create index, drop index, four times, each tme use different index_params to create index
-        expected: return code 0
-        '''
-        nlist = 16384
-        index_params = [{"index_type": IndexType.IVFLAT, "nlist": nlist}, {"index_type": IndexType.IVF_SQ8, "nlist": nlist}]
-        status, ids = connect.add_vectors(ip_table, vectors)
-        for i in range(2):
-            status = connect.create_index(ip_table, index_params[i])
-            assert status.OK()
-            status, result = connect.describe_index(ip_table)
-            assert result._nlist == index_params[i]["nlist"]
-            assert result._table_name == ip_table
-            assert result._index_type == index_params[i]["index_type"]
-            status, result = connect.describe_index(ip_table)
-            logging.getLogger().info(result)
-            status = connect.drop_index(ip_table)
-            assert status.OK()
-            status, result = connect.describe_index(ip_table)
-            logging.getLogger().info(result)
-            assert result._nlist == 16384
-            assert result._table_name == ip_table
-            assert result._index_type == IndexType.FLAT
-
-
-class TestIndexTableInvalid(object):
-    """
-    Test create / describe / drop index interfaces with invalid table names
-    """
-    @pytest.fixture(
-        scope="function",
-        params=gen_invalid_table_names()
-    )
-    def get_table_name(self, request):
-        yield request.param
-
-    @pytest.mark.level(2)
-    def test_create_index_with_invalid_tablename(self, connect, get_table_name):
-        table_name = get_table_name
-        nlist = 16384
-        index_param = {"index_type": IndexType.IVF_SQ8, "nlist": nlist}
-        status = connect.create_index(table_name, index_param)
-        assert not status.OK()
-
-    @pytest.mark.level(2)
-    def test_describe_index_with_invalid_tablename(self, connect, get_table_name):
-        table_name = get_table_name
-        status, result = connect.describe_index(table_name)
-        assert not status.OK()   
-
-    @pytest.mark.level(2)
-    def test_drop_index_with_invalid_tablename(self, connect, get_table_name):
-        table_name = get_table_name
-        status = connect.drop_index(table_name)
-        assert not status.OK()
-
-
-class TestCreateIndexParamsInvalid(object):
-    """
-    Test Building index with invalid table names, table names not in db
-    """
-    @pytest.fixture(
-        scope="function",
-        params=gen_invalid_index_params()
-    )
-    def get_index_params(self, request):
-        yield request.param
-
-    @pytest.mark.level(2)
-    def test_create_index_with_invalid_index_params(self, connect, table, get_index_params):
-        index_params = get_index_params
-        index_type = index_params["index_type"]
-        nlist = index_params["nlist"]
-        logging.getLogger().info(index_params)
-        status, ids = connect.add_vectors(table, vectors)
-        # if not isinstance(index_type, int) or not isinstance(nlist, int):
-        with pytest.raises(Exception) as e:
-            status = connect.create_index(table, index_params)
-        # else:
-        #     status = connect.create_index(table, index_params)
-        #     assert not status.OK()
+        ids = connect.insert(collection, entities)
+        logging.getLogger().info("start index")
+        future = connect.create_index(collection, field_name, get_simple_index, _async=True,
+                                      _callback=self.check_result)
+        logging.getLogger().info("before result")
+        res = future.result()
+        # TODO:
+        logging.getLogger().info(res)

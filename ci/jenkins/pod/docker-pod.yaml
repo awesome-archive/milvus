@@ -7,12 +7,20 @@ metadata:
 spec:
   containers:
   - name: publish-images
-    image: registry.zilliz.com/library/docker:v1.0.0
+    image: registry.zilliz.com/library/docker:v1.1.0
+    imagePullPolicy: Always
     securityContext:
       privileged: true
     command:
     - cat
     tty: true
+    resources:
+      limits:
+        memory: "8Gi"
+        cpu: "2"
+      requests:
+        memory: "2Gi"
+        cpu: "1"
     volumeMounts:
     - name: docker-sock
       mountPath: /var/run/docker.sock
@@ -20,4 +28,8 @@ spec:
   - name: docker-sock
     hostPath:
       path: /var/run/docker.sock
-
+  tolerations:
+  - key: dedicated
+    operator: Equal
+    value: milvus
+    effect: NoSchedule

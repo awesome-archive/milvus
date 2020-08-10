@@ -1,133 +1,71 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "scheduler/task/SearchTask.h"
-#include "db/engine/EngineFactory.h"
-#include "metrics/Metrics.h"
-#include "scheduler/job/SearchJob.h"
-#include "utils/Log.h"
-#include "utils/TimeRecorder.h"
 
-#include <src/scheduler/SchedInst.h>
+#include <fiu-local.h>
+
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
+
+#include "db/Utils.h"
+#include "db/engine/ExecutionEngineImpl.h"
+#include "scheduler/SchedInst.h"
+#include "utils/Log.h"
+#include "utils/TimeRecorder.h"
 
 namespace milvus {
 namespace scheduler {
 
-static constexpr size_t PARALLEL_REDUCE_THRESHOLD = 10000;
-static constexpr size_t PARALLEL_REDUCE_BATCH = 1000;
-
-// TODO(wxyu): remove unused code
-// bool
-// NeedParallelReduce(uint64_t nq, uint64_t topk) {
-//    server::ServerConfig &config = server::ServerConfig::GetInstance();
-//    server::ConfigNode &db_config = config.GetConfig(server::CONFIG_DB);
-//    bool need_parallel = db_config.GetBoolValue(server::CONFIG_DB_PARALLEL_REDUCE, false);
-//    if (!need_parallel) {
-//        return false;
-//    }
-//
-//    return nq * topk >= PARALLEL_REDUCE_THRESHOLD;
-//}
-//
-// void
-// ParallelReduce(std::function<void(size_t, size_t)> &reduce_function, size_t max_index) {
-//    size_t reduce_batch = PARALLEL_REDUCE_BATCH;
-//
-//    auto thread_count = std::thread::hardware_concurrency() - 1; //not all core do this work
-//    if (thread_count > 0) {
-//        reduce_batch = max_index / thread_count + 1;
-//    }
-//    ENGINE_LOG_DEBUG << "use " << thread_count <<
-//                     " thread parallelly do reduce, each thread process " << reduce_batch << " vectors";
-//
-//    std::vector<std::shared_ptr<std::thread> > thread_array;
-//    size_t from_index = 0;
-//    while (from_index < max_index) {
-//        size_t to_index = from_index + reduce_batch;
-//        if (to_index > max_index) {
-//            to_index = max_index;
-//        }
-//
-//        auto reduce_thread = std::make_shared<std::thread>(reduce_function, from_index, to_index);
-//        thread_array.push_back(reduce_thread);
-//
-//        from_index = to_index;
-//    }
-//
-//    for (auto &thread_ptr : thread_array) {
-//        thread_ptr->join();
-//    }
-//}
-
-void
-CollectFileMetrics(int file_type, size_t file_size) {
-    server::MetricsBase& inst = server::Metrics::GetInstance();
-    switch (file_type) {
-        case TableFileSchema::RAW:
-        case TableFileSchema::TO_INDEX: {
-            inst.RawFileSizeHistogramObserve(file_size);
-            inst.RawFileSizeTotalIncrement(file_size);
-            inst.RawFileSizeGaugeSet(file_size);
-            break;
-        }
-        default: {
-            inst.IndexFileSizeHistogramObserve(file_size);
-            inst.IndexFileSizeTotalIncrement(file_size);
-            inst.IndexFileSizeGaugeSet(file_size);
-            break;
-        }
-    }
-}
-
-XSearchTask::XSearchTask(TableFileSchemaPtr file, TaskLabelPtr label)
-    : Task(TaskType::SearchTask, std::move(label)), file_(file) {
-    if (file_) {
-        if (file_->metric_type_ != static_cast<int>(MetricType::L2)) {
-            metric_l2 = false;
-        }
-        index_engine_ = EngineFactory::Build(file_->dimension_, file_->location_, (EngineType)file_->engine_type_,
-                                             (MetricType)file_->metric_type_, file_->nlist_);
-    }
+SearchTask::SearchTask(const server::ContextPtr& context, engine::snapshot::ScopedSnapshotT snapshot,
+                       const engine::DBOptions& options, const query::QueryPtr& query_ptr,
+                       engine::snapshot::ID_TYPE segment_id, TaskLabelPtr label)
+    : Task(TaskType::SearchTask, std::move(label)),
+      context_(context),
+      snapshot_(snapshot),
+      options_(options),
+      query_ptr_(query_ptr),
+      segment_id_(segment_id) {
+    CreateExecEngine();
 }
 
 void
-XSearchTask::Load(LoadType type, uint8_t device_id) {
-    TimeRecorder rc("");
+SearchTask::CreateExecEngine() {
+    if (execution_engine_ == nullptr && query_ptr_ != nullptr) {
+        execution_engine_ = engine::EngineFactory::Build(snapshot_, options_.meta_.path_, segment_id_);
+    }
+}
+
+Status
+SearchTask::OnLoad(LoadType type, uint8_t device_id) {
+    TimeRecorder rc("SearchTask::OnLoad " + std::to_string(segment_id_));
     Status stat = Status::OK();
     std::string error_msg;
     std::string type_str;
 
     try {
         if (type == LoadType::DISK2CPU) {
-            stat = index_engine_->Load();
+            engine::ExecutionEngineContext context;
+            context.query_ptr_ = query_ptr_;
+            stat = execution_engine_->Load(context);
             type_str = "DISK2CPU";
         } else if (type == LoadType::CPU2GPU) {
-            bool hybrid = false;
-            if (index_engine_->IndexEngineType() == engine::EngineType::FAISS_IVFSQ8H) {
-                hybrid = true;
-            }
-            stat = index_engine_->CopyToGpu(device_id, hybrid);
-            type_str = "CPU2GPU";
+            stat = execution_engine_->CopyToGpu(device_id);
+            type_str = "CPU2GPU" + std::to_string(device_id);
         } else if (type == LoadType::GPU2CPU) {
-            stat = index_engine_->CopyToCpu();
+            // stat = engine_->CopyToCpu();
             type_str = "GPU2CPU";
         } else {
             error_msg = "Wrong load type";
@@ -136,126 +74,93 @@ XSearchTask::Load(LoadType type, uint8_t device_id) {
     } catch (std::exception& ex) {
         // typical error: out of disk space or permition denied
         error_msg = "Failed to load index file: " + std::string(ex.what());
+        LOG_ENGINE_ERROR_ << LogOut("Search task encounter exception: %s", error_msg.c_str());
         stat = Status(SERVER_UNEXPECTED_ERROR, error_msg);
     }
 
     if (!stat.ok()) {
         Status s;
         if (stat.ToString().find("out of memory") != std::string::npos) {
-            error_msg = "out of memory: " + type_str;
+            error_msg = "out of memory: " + type_str + " : " + stat.message();
             s = Status(SERVER_OUT_OF_MEMORY, error_msg);
         } else {
-            error_msg = "Failed to load index file: " + type_str;
+            error_msg = "Failed to load index file: " + type_str + " : " + stat.message();
             s = Status(SERVER_UNEXPECTED_ERROR, error_msg);
         }
 
-        if (auto job = job_.lock()) {
-            auto search_job = std::static_pointer_cast<scheduler::SearchJob>(job);
-            search_job->SearchDone(file_->id_);
-            search_job->GetStatus() = s;
-        }
-
-        return;
+        return s;
     }
 
-    size_t file_size = index_engine_->PhysicalSize();
+    std::string info = "Search task load segment id: " + std::to_string(segment_id_) + " " + type_str + " totally cost";
+    rc.ElapseFromBegin(info);
 
-    std::string info = "Load file id:" + std::to_string(file_->id_) +
-                       " file type:" + std::to_string(file_->file_type_) + " size:" + std::to_string(file_size) +
-                       " bytes from location: " + file_->location_ + " totally cost";
-    double span = rc.ElapseFromBegin(info);
-    //    for (auto &context : search_contexts_) {
-    //        context->AccumLoadCost(span);
-    //    }
-
-    CollectFileMetrics(file_->file_type_, file_size);
-
-    // step 2: return search task for later execution
-    index_id_ = file_->id_;
-    index_type_ = file_->file_type_;
-    //    search_contexts_.swap(search_contexts_);
+    return Status::OK();
 }
 
-void
-XSearchTask::Execute() {
-    if (index_engine_ == nullptr) {
-        return;
+Status
+SearchTask::OnExecute() {
+    milvus::server::ContextFollower tracer(context_, "XSearchTask::Execute " + std::to_string(segment_id_));
+    TimeRecorder rc(LogOut("[%s][%ld] DoSearch file id:%ld", "search", 0, segment_id_));
+
+    if (execution_engine_ == nullptr) {
+        return Status(DB_ERROR, "execution engine is null");
     }
 
-    //    ENGINE_LOG_DEBUG << "Searching in file id:" << index_id_ << " with "
-    //                     << search_contexts_.size() << " tasks";
+    //    auto search_job = std::static_pointer_cast<scheduler::SearchJob>(std::shared_ptr<scheduler::Job>(job_));
+    auto search_job = static_cast<scheduler::SearchJob*>(job_);
+    try {
+        /* step 2: search */
+        engine::ExecutionEngineContext context;
+        context.query_ptr_ = query_ptr_;
+        context.query_result_ = std::make_shared<engine::QueryResult>();
+        STATUS_CHECK(execution_engine_->Search(context));
 
-    TimeRecorder rc("DoSearch file id:" + std::to_string(index_id_));
+        rc.RecordSection("search done");
 
-    server::CollectDurationMetrics metrics(index_type_);
-
-    std::vector<int64_t> output_ids;
-    std::vector<float> output_distance;
-
-    if (auto job = job_.lock()) {
-        auto search_job = std::static_pointer_cast<scheduler::SearchJob>(job);
-        // step 1: allocate memory
-        uint64_t nq = search_job->nq();
-        uint64_t topk = search_job->topk();
-        uint64_t nprobe = search_job->nprobe();
-        const float* vectors = search_job->vectors();
-
-        output_ids.resize(topk * nq);
-        output_distance.resize(topk * nq);
-        std::string hdr =
-            "job " + std::to_string(search_job->id()) + " nq " + std::to_string(nq) + " topk " + std::to_string(topk);
-
-        try {
-            // step 2: search
-            bool hybrid = false;
-            if (index_engine_->IndexEngineType() == engine::EngineType::FAISS_IVFSQ8H &&
-                ResMgrInst::GetInstance()->GetResource(path().Last())->type() == ResourceType::CPU) {
-                hybrid = true;
+        /* step 3: pick up topk result */
+        // TODO(yukun): Remove hardcode here
+        auto vector_param = context.query_ptr_->vectors.begin()->second;
+        auto topk = vector_param->topk;
+        auto segment_ptr = snapshot_->GetSegmentCommitBySegmentId(segment_id_);
+        auto spec_k = segment_ptr->GetRowCount() < topk ? segment_ptr->GetRowCount() : topk;
+        int64_t nq = vector_param->nq;
+        if (spec_k == 0) {
+            LOG_ENGINE_WARNING_ << LogOut("[%s][%ld] Searching in an empty segment. segment id = %d", "search", 0,
+                                          segment_ptr->GetID());
+        } else {
+            //            std::unique_lock<std::mutex> lock(search_job->mutex());
+            if (!search_job->query_result()) {
+                search_job->query_result() = std::make_shared<engine::QueryResult>();
+                search_job->query_result()->row_num_ = nq;
             }
-            index_engine_->Search(nq, vectors, topk, nprobe, output_distance.data(), output_ids.data(), hybrid);
-
-            double span = rc.RecordSection(hdr + ", do search");
-            //            search_job->AccumSearchCost(span);
-
-            // step 3: pick up topk result
-            auto spec_k = index_engine_->Count() < topk ? index_engine_->Count() : topk;
-            {
-                std::unique_lock<std::mutex> lock(search_job->mutex());
-                XSearchTask::MergeTopkToResultSet(output_ids, output_distance, spec_k, nq, topk, metric_l2,
-                                                  search_job->GetResultIds(), search_job->GetResultDistances());
-            }
-
-            span = rc.RecordSection(hdr + ", reduce topk");
-            //            search_job->AccumReduceCost(span);
-        } catch (std::exception& ex) {
-            ENGINE_LOG_ERROR << "SearchTask encounter exception: " << ex.what();
-            //            search_job->IndexSearchDone(index_id_);//mark as done avoid dead lock, even search failed
+            SearchTask::MergeTopkToResultSet(context.query_result_->result_ids_,
+                                             context.query_result_->result_distances_, spec_k, nq, topk,
+                                             ascending_reduce_, search_job->query_result());
         }
 
-        // step 4: notify to send result to client
-        search_job->SearchDone(index_id_);
+        rc.RecordSection("reduce topk done");
+    } catch (std::exception& ex) {
+        LOG_ENGINE_ERROR_ << LogOut("[%s][%ld] SearchTask encounter exception: %s", "search", 0, ex.what());
+        return Status(SERVER_UNEXPECTED_ERROR, ex.what());
     }
 
     rc.ElapseFromBegin("totally cost");
-
-    // release index in resource
-    index_engine_ = nullptr;
+    return Status::OK();
 }
 
 void
-XSearchTask::MergeTopkToResultSet(const scheduler::ResultIds& src_ids, const scheduler::ResultDistances& src_distances,
-                                  size_t src_k, size_t nq, size_t topk, bool ascending, scheduler::ResultIds& tar_ids,
-                                  scheduler::ResultDistances& tar_distances) {
+SearchTask::MergeTopkToResultSet(const engine::ResultIds& src_ids, const engine::ResultDistances& src_distances,
+                                 size_t src_k, size_t nq, size_t topk, bool ascending, engine::QueryResultPtr& result) {
     if (src_ids.empty()) {
+        LOG_ENGINE_DEBUG_ << LogOut("[%s][%d] Search result is empty.", "search", 0);
         return;
     }
 
-    size_t tar_k = tar_ids.size() / nq;
+    size_t tar_k = result->result_ids_.size() / nq;
     size_t buf_k = std::min(topk, src_k + tar_k);
 
-    scheduler::ResultIds buf_ids(nq * buf_k, -1);
-    scheduler::ResultDistances buf_distances(nq * buf_k, 0.0);
-
+    engine::ResultIds buf_ids(nq * buf_k, -1);
+    engine::ResultDistances buf_distances(nq * buf_k, 0.0);
     for (uint64_t i = 0; i < nq; i++) {
         size_t buf_k_j = 0, src_k_j = 0, tar_k_j = 0;
         size_t buf_idx, src_idx, tar_idx;
@@ -269,14 +174,15 @@ XSearchTask::MergeTopkToResultSet(const scheduler::ResultIds& src_ids, const sch
             tar_idx = tar_k_multi_i + tar_k_j;
             buf_idx = buf_k_multi_i + buf_k_j;
 
-            if ((ascending && src_distances[src_idx] < tar_distances[tar_idx]) ||
-                (!ascending && src_distances[src_idx] > tar_distances[tar_idx])) {
+            if ((result->result_ids_[tar_idx] == -1) ||  // initialized value
+                (ascending && src_distances[src_idx] < result->result_distances_[tar_idx]) ||
+                (!ascending && src_distances[src_idx] > result->result_distances_[tar_idx])) {
                 buf_ids[buf_idx] = src_ids[src_idx];
                 buf_distances[buf_idx] = src_distances[src_idx];
                 src_k_j++;
             } else {
-                buf_ids[buf_idx] = tar_ids[tar_idx];
-                buf_distances[buf_idx] = tar_distances[tar_idx];
+                buf_ids[buf_idx] = result->result_ids_[tar_idx];
+                buf_distances[buf_idx] = result->result_distances_[tar_idx];
                 tar_k_j++;
             }
             buf_k_j++;
@@ -296,83 +202,22 @@ XSearchTask::MergeTopkToResultSet(const scheduler::ResultIds& src_ids, const sch
                 while (buf_k_j < buf_k && tar_k_j < tar_k) {
                     buf_idx = buf_k_multi_i + buf_k_j;
                     tar_idx = tar_k_multi_i + tar_k_j;
-                    buf_ids[buf_idx] = tar_ids[tar_idx];
-                    buf_distances[buf_idx] = tar_distances[tar_idx];
+                    buf_ids[buf_idx] = result->result_ids_[tar_idx];
+                    buf_distances[buf_idx] = result->result_distances_[tar_idx];
                     tar_k_j++;
                     buf_k_j++;
                 }
             }
         }
     }
-    tar_ids.swap(buf_ids);
-    tar_distances.swap(buf_distances);
+    result->result_ids_.swap(buf_ids);
+    result->result_distances_.swap(buf_distances);
 }
 
-// void
-// XSearchTask::MergeTopkArray(std::vector<int64_t>& tar_ids, std::vector<float>& tar_distance, uint64_t& tar_input_k,
-//                            const std::vector<int64_t>& src_ids, const std::vector<float>& src_distance,
-//                            uint64_t src_input_k, uint64_t nq, uint64_t topk, bool ascending) {
-//    if (src_ids.empty() || src_distance.empty()) {
-//        return;
-//    }
-//
-//    uint64_t output_k = std::min(topk, tar_input_k + src_input_k);
-//    std::vector<int64_t> id_buf(nq * output_k, -1);
-//    std::vector<float> dist_buf(nq * output_k, 0.0);
-//
-//    uint64_t buf_k, src_k, tar_k;
-//    uint64_t src_idx, tar_idx, buf_idx;
-//    uint64_t src_input_k_multi_i, tar_input_k_multi_i, buf_k_multi_i;
-//
-//    for (uint64_t i = 0; i < nq; i++) {
-//        src_input_k_multi_i = src_input_k * i;
-//        tar_input_k_multi_i = tar_input_k * i;
-//        buf_k_multi_i = output_k * i;
-//        buf_k = src_k = tar_k = 0;
-//        while (buf_k < output_k && src_k < src_input_k && tar_k < tar_input_k) {
-//            src_idx = src_input_k_multi_i + src_k;
-//            tar_idx = tar_input_k_multi_i + tar_k;
-//            buf_idx = buf_k_multi_i + buf_k;
-//            if ((ascending && src_distance[src_idx] < tar_distance[tar_idx]) ||
-//                (!ascending && src_distance[src_idx] > tar_distance[tar_idx])) {
-//                id_buf[buf_idx] = src_ids[src_idx];
-//                dist_buf[buf_idx] = src_distance[src_idx];
-//                src_k++;
-//            } else {
-//                id_buf[buf_idx] = tar_ids[tar_idx];
-//                dist_buf[buf_idx] = tar_distance[tar_idx];
-//                tar_k++;
-//            }
-//            buf_k++;
-//        }
-//
-//        if (buf_k < output_k) {
-//            if (src_k < src_input_k) {
-//                while (buf_k < output_k && src_k < src_input_k) {
-//                    src_idx = src_input_k_multi_i + src_k;
-//                    buf_idx = buf_k_multi_i + buf_k;
-//                    id_buf[buf_idx] = src_ids[src_idx];
-//                    dist_buf[buf_idx] = src_distance[src_idx];
-//                    src_k++;
-//                    buf_k++;
-//                }
-//            } else {
-//                while (buf_k < output_k && tar_k < tar_input_k) {
-//                    tar_idx = tar_input_k_multi_i + tar_k;
-//                    buf_idx = buf_k_multi_i + buf_k;
-//                    id_buf[buf_idx] = tar_ids[tar_idx];
-//                    dist_buf[buf_idx] = tar_distance[tar_idx];
-//                    tar_k++;
-//                    buf_k++;
-//                }
-//            }
-//        }
-//    }
-//
-//    tar_ids.swap(id_buf);
-//    tar_distance.swap(dist_buf);
-//    tar_input_k = output_k;
-//}
+int64_t
+SearchTask::nq() {
+    return 0;
+}
 
 }  // namespace scheduler
 }  // namespace milvus

@@ -1,195 +1,123 @@
 #-------------------------------------------------------------------------------
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright (C) 2019-2020 Zilliz. All rights reserved.
 #
-#   http:#www.apache.org/licenses/LICENSE-2.0
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under the License.
 #-------------------------------------------------------------------------------
 
 include_directories(${MILVUS_SOURCE_DIR})
 include_directories(${MILVUS_ENGINE_SRC})
+include_directories(${MILVUS_THIRDPARTY_SRC})
 
-include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include)
 include_directories(${MILVUS_ENGINE_SRC}/grpc/gen-status)
 include_directories(${MILVUS_ENGINE_SRC}/grpc/gen-milvus)
 
-#this statement must put here, since the INDEX_INCLUDE_DIRS is defined in code/CMakeList.txt
-add_subdirectory(index)
+set(FOUND_OPENBLAS "unknown")
 
+add_subdirectory(index)
 set(INDEX_INCLUDE_DIRS ${INDEX_INCLUDE_DIRS} PARENT_SCOPE)
-foreach (dir ${INDEX_INCLUDE_DIRS})
-    include_directories(${dir})
+foreach (DIR ${INDEX_INCLUDE_DIRS})
+    include_directories(${DIR})
 endforeach ()
 
-aux_source_directory(${MILVUS_ENGINE_SRC}/cache cache_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/config config_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/metrics metrics_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/db db_main_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/db/engine db_engine_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/db/insert db_insert_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/db/meta db_meta_files)
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler            SCHEDULER_MAIN_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/action     SCHEDULER_ACTION_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/event      SCHEDULER_EVENT_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/job        SCHEDULER_JOB_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/selector   SCHEDULER_SELECTOR_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/resource   SCHEDULER_RESOURCE_FILES )
+aux_source_directory( ${MILVUS_ENGINE_SRC}/scheduler/task       SCHEDULER_TASK_FILES )
 
-set(grpc_service_files
-        ${MILVUS_ENGINE_SRC}/grpc/gen-milvus/milvus.grpc.pb.cc
-        ${MILVUS_ENGINE_SRC}/grpc/gen-milvus/milvus.pb.cc
-        ${MILVUS_ENGINE_SRC}/grpc/gen-status/status.grpc.pb.cc
-        ${MILVUS_ENGINE_SRC}/grpc/gen-status/status.pb.cc
+set( SCHEDULER_FILES  ${SCHEDULER_MAIN_FILES}
+                      ${SCHEDULER_ACTION_FILES}
+                      ${SCHEDULER_EVENT_FILES}
+                      ${SCHEDULER_JOB_FILES}
+                      ${SCHEDULER_SELECTOR_FILES}
+                      ${SCHEDULER_RESOURCE_FILES}
+                      ${SCHEDULER_TASK_FILES}
+                      )
+
+# dependencies of target milvus_engine
+add_subdirectory( storage )
+add_subdirectory( cache )
+add_subdirectory( codecs )
+add_subdirectory( segment )
+
+add_subdirectory( utils )
+add_subdirectory( metrics )
+add_subdirectory( config )
+add_subdirectory( tracing )
+add_subdirectory( query )
+add_subdirectory( db ) # target milvus_engine
+add_subdirectory( log )
+add_subdirectory( server )
+
+set(link_lib
+        milvus_engine
+        config
+        metrics
+        tracing
+        log
+        oatpp
+        query
+        utils
         )
 
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler scheduler_main_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/action scheduler_action_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/event scheduler_event_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/job scheduler_job_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/optimizer scheduler_optimizer_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/resource scheduler_resource_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/scheduler/task scheduler_task_files)
-set(scheduler_files
-        ${scheduler_main_files}
-        ${scheduler_action_files}
-        ${scheduler_event_files}
-        ${scheduler_job_files}
-        ${scheduler_optimizer_files}
-        ${scheduler_resource_files}
-        ${scheduler_task_files}
-        )
-
-aux_source_directory(${MILVUS_ENGINE_SRC}/external/easyloggingpp external_easyloggingpp_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/external/nlohmann external_nlohmann_files)
-set(external_files
-        ${external_easyloggingpp_files}
-        ${external_nlohmann_files}
-        )
-
-aux_source_directory(${MILVUS_ENGINE_SRC}/server server_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/server/grpc_impl grpc_server_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/utils utils_files)
-aux_source_directory(${MILVUS_ENGINE_SRC}/wrapper wrapper_files)
-
-set(engine_files
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${cache_files}
-        ${db_main_files}
-        ${db_engine_files}
-        ${db_insert_files}
-        ${db_meta_files}
-        ${metrics_files}
-        ${external_files}
-        ${utils_files}
-        ${wrapper_files}
-        )
-
-set(client_grpc_lib
-        grpcpp_channelz
-        grpc++
-        grpc
-        grpc_protobuf
-        grpc_protoc
-        )
-
-set(prometheus_lib
-        prometheus-cpp-push
-        prometheus-cpp-pull
-        prometheus-cpp-core
-        )
-
-set(boost_lib
-        libboost_system.a
-        libboost_filesystem.a
-        libboost_serialization.a
-        )
-
-set(cuda_lib
-        ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs/libnvidia-ml.so
-        cudart
-        cublas
-        )
-
-set(third_party_libs
-        sqlite
-        ${client_grpc_lib}
-        yaml-cpp
-        ${prometheus_lib}
-        ${cuda_lib}
-        mysqlpp
-        zlib
-        ${boost_lib}
-        )
-
-if (MILVUS_ENABLE_PROFILING STREQUAL "ON")
-    set(third_party_libs ${third_party_libs}
-        gperftools
-        libunwind
-        )
-endif ()
-
-link_directories("${CUDA_TOOLKIT_ROOT_DIR}/lib64")
-set(engine_libs
-        pthread
-        libgomp.a
-        libgfortran.a
-        )
-
-if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
-    set(engine_libs
-            ${engine_libs}
-            libquadmath.a
+if (MILVUS_WITH_PROMETHEUS)
+    set(link_lib
+            ${link_lib}
+            # dependency prometheus
+            prometheus-cpp-push
+            prometheus-cpp-pull
+            prometheus-cpp-core
             )
 endif ()
 
-cuda_add_library(milvus_engine STATIC ${engine_files})
-target_link_libraries(milvus_engine
-        knowhere
-        ${engine_libs}
-        ${third_party_libs}
+set(link_lib
+        ${link_lib}
+        curl
         )
 
-add_library(metrics STATIC ${metrics_files})
+target_link_libraries( server
+                PUBLIC ${link_lib}
+                       )
 
-set(metrics_lib
-        yaml-cpp
-        ${prometheus_lib}
-        )
+# **************************** Get&Print Include Directories ****************************
+get_property( dirs DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES )
 
-target_link_libraries(metrics ${metrics_lib})
+foreach ( dir ${dirs} )
+    message( STATUS "Current Include DIRS: " ${dir} )
+endforeach ()
 
-set(server_libs
-        milvus_engine
-        pthread
-        dl
-        metrics
-        )
+set( SERVER_LIBS server )
 
-add_executable(milvus_server
-        ${config_files}
-        ${metrics_files}
-        ${scheduler_files}
-        ${server_files}
-        ${grpc_server_files}
-        ${grpc_service_files}
-        ${utils_files}
-        )
 
-target_link_libraries(milvus_server
-        ${server_libs}
-        )
+add_executable( milvus_server   ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+                                ${SCHEDULER_FILES}
+                                )
 
-install(TARGETS milvus_server DESTINATION bin)
+target_link_libraries( milvus_server PRIVATE ${SERVER_LIBS} )
+install( TARGETS milvus_server DESTINATION bin )
 
-install(FILES
-        ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}
-        ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}.3
-        ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}.3.2.4
-        DESTINATION lib)
+install( FILES
+         ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}
+         ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}.3
+         ${CMAKE_BINARY_DIR}/mysqlpp_ep-prefix/src/mysqlpp_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}mysqlpp${CMAKE_SHARED_LIBRARY_SUFFIX}.3.2.4
+         ${CMAKE_BINARY_DIR}/fiu_ep-prefix/src/fiu_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}fiu${CMAKE_SHARED_LIBRARY_SUFFIX}
+         ${CMAKE_BINARY_DIR}/fiu_ep-prefix/src/fiu_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}fiu${CMAKE_SHARED_LIBRARY_SUFFIX}.0
+         ${CMAKE_BINARY_DIR}/fiu_ep-prefix/src/fiu_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}fiu${CMAKE_SHARED_LIBRARY_SUFFIX}.1.00
+         DESTINATION lib )
 
-add_subdirectory(sdk)
+if ( FOUND_OPENBLAS STREQUAL "false" )
+    install( FILES
+        ${CMAKE_BINARY_DIR}/src/index/openblas_ep-prefix/src/openblas_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}openblas${CMAKE_SHARED_LIBRARY_SUFFIX}
+        ${CMAKE_BINARY_DIR}/src/index/openblas_ep-prefix/src/openblas_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}openblas${CMAKE_SHARED_LIBRARY_SUFFIX}.0
+        ${CMAKE_BINARY_DIR}/src/index/openblas_ep-prefix/src/openblas_ep/lib/${CMAKE_SHARED_LIBRARY_PREFIX}openblas${CMAKE_SHARED_LIBRARY_SUFFIX}.0.3
+        DESTINATION lib )
+endif()

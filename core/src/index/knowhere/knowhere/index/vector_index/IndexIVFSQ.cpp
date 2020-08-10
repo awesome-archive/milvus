@@ -1,59 +1,59 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include <faiss/gpu/GpuCloner.h>
-#include <faiss/index_factory.h>
 #include <memory>
+#include <string>
 
-#include "knowhere/adapter/VectorAdapter.h"
+#ifdef MILVUS_GPU_VERSION
+#include <faiss/gpu/GpuAutoTune.h>
+#include <faiss/gpu/GpuCloner.h>
+#endif
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexScalarQuantizer.h>
+#include <faiss/clone_index.h>
+#include <faiss/index_factory.h>
+
 #include "knowhere/common/Exception.h"
-#include "knowhere/index/vector_index/IndexGPUIVFSQ.h"
 #include "knowhere/index/vector_index/IndexIVFSQ.h"
+#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
+#include "knowhere/index/vector_index/helpers/IndexParameter.h"
+#ifdef MILVUS_GPU_VERSION
+#include "knowhere/index/vector_index/gpu/IndexGPUIVFSQ.h"
 #include "knowhere/index/vector_index/helpers/FaissGpuResourceMgr.h"
+#endif
 
+namespace milvus {
 namespace knowhere {
 
-IndexModelPtr
-IVFSQ::Train(const DatasetPtr& dataset, const Config& config) {
-    auto build_cfg = std::dynamic_pointer_cast<IVFSQCfg>(config);
-    if (build_cfg != nullptr) {
-        build_cfg->CheckValid();  // throw exception
-    }
+void
+IVFSQ::Train(const DatasetPtr& dataset_ptr, const Config& config) {
+    GET_TENSOR_DATA_DIM(dataset_ptr)
 
-    GETTENSOR(dataset)
+    // std::stringstream index_type;
+    // index_type << "IVF" << config[IndexParams::nlist] << ","
+    //           << "SQ" << config[IndexParams::nbits];
+    // index_ = std::shared_ptr<faiss::Index>(
+    //    faiss::index_factory(dim, index_type.str().c_str(), GetMetricType(config[Metric::TYPE].get<std::string>())));
 
-    std::stringstream index_type;
-    index_type << "IVF" << build_cfg->nlist << ","
-               << "SQ" << build_cfg->nbits;
-    auto build_index = faiss::index_factory(dim, index_type.str().c_str(), GetMetricType(build_cfg->metric_type));
-    build_index->train(rows, (float*)p_data);
+    faiss::MetricType metric_type = GetMetricType(config[Metric::TYPE].get<std::string>());
+    faiss::Index* coarse_quantizer = new faiss::IndexFlat(dim, metric_type);
+    index_ = std::shared_ptr<faiss::Index>(new faiss::IndexIVFScalarQuantizer(
+        coarse_quantizer, dim, config[IndexParams::nlist].get<int64_t>(), faiss::QuantizerType::QT_8bit, metric_type));
 
-    std::shared_ptr<faiss::Index> ret_index;
-    ret_index.reset(build_index);
-    return std::make_shared<IVFIndexModel>(ret_index);
+    index_->train(rows, (float*)p_data);
 }
 
-VectorIndexPtr
-IVFSQ::Clone_impl(const std::shared_ptr<faiss::Index>& index) {
-    return std::make_shared<IVFSQ>(index);
-}
-
-VectorIndexPtr
-IVFSQ::CopyCpuToGpu(const int64_t& device_id, const Config& config) {
+VecIndexPtr
+IVFSQ::CopyCpuToGpu(const int64_t device_id, const Config& config) {
+#ifdef MILVUS_GPU_VERSION
     if (auto res = FaissGpuResourceMgr::GetInstance().GetRes(device_id)) {
         ResScope rs(res, device_id, false);
 
@@ -65,6 +65,24 @@ IVFSQ::CopyCpuToGpu(const int64_t& device_id, const Config& config) {
     } else {
         KNOWHERE_THROW_MSG("CopyCpuToGpu Error, can't get gpu_resource");
     }
+#else
+    KNOWHERE_THROW_MSG("Calling IVFSQ::CopyCpuToGpu when we are using CPU version");
+#endif
+}
+
+void
+IVFSQ::UpdateIndexSize() {
+    if (!index_) {
+        KNOWHERE_THROW_MSG("index not initialize");
+    }
+    auto ivfsq_index = dynamic_cast<faiss::IndexIVFScalarQuantizer*>(index_.get());
+    auto nb = ivfsq_index->invlists->compute_ntotal();
+    auto code_size = ivfsq_index->code_size;
+    auto nlist = ivfsq_index->nlist;
+    auto d = ivfsq_index->d;
+    // ivf codes, ivf ids, sq trained vectors and quantizer
+    index_size_ = nb * code_size + nb * sizeof(int64_t) + 2 * d * sizeof(float) + nlist * d * sizeof(float);
 }
 
 }  // namespace knowhere
+}  // namespace milvus

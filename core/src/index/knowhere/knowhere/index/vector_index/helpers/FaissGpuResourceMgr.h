@@ -1,19 +1,13 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License
 
 #pragma once
 
@@ -26,6 +20,7 @@
 
 #include "src/utils/BlockingQueue.h"
 
+namespace milvus {
 namespace knowhere {
 
 struct Resource {
@@ -44,7 +39,7 @@ using ResWPtr = std::weak_ptr<Resource>;
 class FaissGpuResourceMgr {
  public:
     friend class ResScope;
-    using ResBQ = milvus::server::BlockingQueue<ResPtr>;
+    using ResBQ = BlockingQueue<ResPtr>;
 
  public:
     struct DeviceParams {
@@ -63,7 +58,7 @@ class FaissGpuResourceMgr {
     Free();
 
     void
-    AllocateTempMem(ResPtr& resource, const int64_t& device_id, const int64_t& size);
+    AllocateTempMem(ResPtr& resource, const int64_t device_id, const int64_t size);
 
     void
     InitDevice(int64_t device_id, int64_t pin_mem_size = 0, int64_t temp_mem_size = 0, int64_t res_num = 2);
@@ -73,16 +68,17 @@ class FaissGpuResourceMgr {
 
     // allocate gpu memory invoke by build or copy_to_gpu
     ResPtr
-    GetRes(const int64_t& device_id, const int64_t& alloc_size = 0);
+    GetRes(const int64_t device_id, const int64_t alloc_size = 0);
 
     void
-    MoveToIdle(const int64_t& device_id, const ResPtr& res);
+    MoveToIdle(const int64_t device_id, const ResPtr& res);
 
     void
     Dump();
 
  protected:
-    bool is_init = false;
+    bool initialized_ = false;
+    std::mutex init_mutex_;
 
     std::map<int64_t, std::unique_ptr<std::mutex>> mutex_cache_;
     std::map<int64_t, DeviceParams> devices_params_;
@@ -91,19 +87,19 @@ class FaissGpuResourceMgr {
 
 class ResScope {
  public:
-    ResScope(ResPtr& res, const int64_t& device_id, const bool& isown)
+    ResScope(ResPtr& res, const int64_t device_id, const bool isown)
         : resource(res), device_id(device_id), move(true), own(isown) {
         Lock();
     }
 
-    ResScope(ResWPtr& res, const int64_t& device_id, const bool& isown)
+    ResScope(ResWPtr& res, const int64_t device_id, const bool isown)
         : resource(res), device_id(device_id), move(true), own(isown) {
         Lock();
     }
 
     // specif for search
     // get the ownership of gpuresource and gpu
-    ResScope(ResWPtr& res, const int64_t& device_id) : device_id(device_id), move(false), own(true) {
+    ResScope(ResWPtr& res, const int64_t device_id) : device_id(device_id), move(false), own(true) {
         resource = res.lock();
         Lock();
     }
@@ -131,3 +127,4 @@ class ResScope {
 };
 
 }  // namespace knowhere
+}  // namespace milvus

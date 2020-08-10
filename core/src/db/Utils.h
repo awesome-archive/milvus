@@ -1,28 +1,22 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
-#include "Options.h"
-#include "db/Types.h"
-#include "db/meta/MetaTypes.h"
-
 #include <ctime>
 #include <string>
+
+#include "Options.h"
+#include "db/Types.h"
+#include "utils/Status.h"
 
 namespace milvus {
 namespace engine {
@@ -31,26 +25,17 @@ namespace utils {
 int64_t
 GetMicroSecTimeStamp();
 
-Status
-CreateTablePath(const DBMetaOptions& options, const std::string& table_id);
-Status
-DeleteTablePath(const DBMetaOptions& options, const std::string& table_id, bool force = true);
-
-Status
-CreateTableFilePath(const DBMetaOptions& options, meta::TableFileSchema& table_file);
-Status
-GetTableFilePath(const DBMetaOptions& options, meta::TableFileSchema& table_file);
-Status
-DeleteTableFilePath(const DBMetaOptions& options, meta::TableFileSchema& table_file);
+bool
+IsSameIndex(const CollectionIndex& index1, const CollectionIndex& index2);
 
 bool
-IsSameIndex(const TableIndex& index1, const TableIndex& index2);
+IsBinaryMetricType(const std::string& metric_type);
 
-meta::DateT
+engine::date_t
 GetDate(const std::time_t& t, int day_delta = 0);
-meta::DateT
+engine::date_t
 GetDate();
-meta::DateT
+engine::date_t
 GetDateWithDelta(int day_delta);
 
 struct MetaUriInfo {
@@ -64,6 +49,12 @@ struct MetaUriInfo {
 
 Status
 ParseMetaUri(const std::string& uri, MetaUriInfo& info);
+
+void
+SendExitSignal();
+
+void
+GetIDFromChunk(const engine::DataChunkPtr& chunk, engine::IDNumbers& ids);
 
 }  // namespace utils
 }  // namespace engine

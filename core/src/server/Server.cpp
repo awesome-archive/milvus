@@ -1,36 +1,41 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
+
+#include "server/Server.h"
+#include "server/init/InstanceLockCheck.h"
 
 #include <fcntl.h>
-#include <string.h>
 #include <unistd.h>
+#include <boost/filesystem.hpp>
+#include <cstring>
+#include <unordered_map>
 
+#include "config/ServerConfig.h"
+#include "index/archive/KnowhereResource.h"
+#include "log/LogMgr.h"
 #include "metrics/Metrics.h"
 #include "scheduler/SchedInst.h"
-#include "server/Config.h"
 #include "server/DBWrapper.h"
-#include "server/Server.h"
 #include "server/grpc_impl/GrpcServer.h"
+#include "server/init/CpuChecker.h"
+#include "server/init/GpuChecker.h"
+#include "server/init/StorageChecker.h"
+#include "server/web_impl/WebServer.h"
 #include "src/version.h"
+//#include "storage/s3/S3ClientWrapper.h"
+#include <yaml-cpp/yaml.h>
+#include "tracing/TracerUtil.h"
 #include "utils/Log.h"
-#include "utils/LogUtil.h"
-#include "utils/SignalUtil.h"
+#include "utils/SignalHandler.h"
 #include "utils/TimeRecorder.h"
-#include "wrapper/KnowhereResource.h"
 
 namespace milvus {
 namespace server {
@@ -42,12 +47,10 @@ Server::GetInstance() {
 }
 
 void
-Server::Init(int64_t daemonized, const std::string& pid_filename, const std::string& config_filename,
-             const std::string& log_config_file) {
+Server::Init(int64_t daemonized, const std::string& pid_filename, const std::string& config_filename) {
     daemonized_ = daemonized;
     pid_filename_ = pid_filename;
     config_filename_ = config_filename;
-    log_config_file_ = log_config_file;
 }
 
 void
@@ -57,10 +60,6 @@ Server::Daemonize() {
     }
 
     std::cout << "Milvus server run in daemonize mode";
-
-    //    std::string log_path(GetLogDirFullPath());
-    //    log_path += "zdb_server.(INFO/WARNNING/ERROR/CRITICAL)";
-    //    SERVER_LOG_INFO << "Log will be exported to: " + log_path);
 
     pid_t pid = 0;
 
@@ -152,14 +151,20 @@ Server::Start() {
             return s;
         }
 
-        /* log path is defined in Config file, so InitLog must be called after LoadConfig */
-        Config& config = Config::GetInstance();
-        std::string time_zone;
-        s = config.GetServerConfigTimeZone(time_zone);
-        if (!s.ok()) {
-            std::cerr << "Fail to get server config timezone" << std::endl;
-            return s;
+        auto meta_uri = config.general.meta_uri();
+        if (meta_uri.length() > 6 && strcasecmp("sqlite", meta_uri.substr(0, 6).c_str()) == 0) {
+            std::cout << "WARNNING: You are using SQLite as the meta data management, "
+                         "which can't be used in production. Please change it to MySQL!"
+                      << std::endl;
         }
+
+        /* Init opentracing tracer from config */
+        std::string tracing_config_path = config.tracing.json_config_path();
+        tracing_config_path.empty() ? tracing::TracerUtil::InitGlobal()
+                                    : tracing::TracerUtil::InitGlobal(tracing_config_path);
+
+        /* log path is defined in Config file, so InitLog must be called after LoadConfig */
+        auto time_zone = config.general.timezone();
 
         if (time_zone.length() == 3) {
             time_zone = "CUT";
@@ -179,16 +184,108 @@ Server::Start() {
         }
         tzset();
 
-        InitLog(log_config_file_);
+        {
+            std::unordered_map<std::string, int64_t> level_to_int{
+                {"debug", 5}, {"info", 4}, {"warning", 3}, {"error", 2}, {"fatal", 1},
+            };
+
+            bool trace_enable = config.logs.trace.enable();
+            bool debug_enable = false;
+            bool info_enable = false;
+            bool warning_enable = false;
+            bool error_enable = false;
+            bool fatal_enable = false;
+            std::string logs_path = config.logs.path();
+            int64_t max_log_file_size = config.logs.max_log_file_size();
+            int64_t delete_exceeds = config.logs.log_rotate_num();
+
+            switch (level_to_int[config.logs.level()]) {
+                case 5:
+                    debug_enable = true;
+                case 4:
+                    info_enable = true;
+                case 3:
+                    warning_enable = true;
+                case 2:
+                    error_enable = true;
+                case 1:
+                    fatal_enable = true;
+                    break;
+                default:
+                    return Status(SERVER_UNEXPECTED_ERROR, "invalid log level");
+            }
+
+            LogMgr::InitLog(trace_enable, debug_enable, info_enable, warning_enable, error_enable, fatal_enable,
+                            logs_path, max_log_file_size, delete_exceeds);
+        }
+
+        bool cluster_enable = config.cluster.enable();
+        auto cluster_role = config.cluster.role();
+
+        if ((not cluster_enable) || cluster_role == ClusterRole::RW) {
+            try {
+                // True if a new directory was created, otherwise false.
+                boost::filesystem::create_directories(config.storage.path());
+            } catch (std::exception& ex) {
+                return Status(SERVER_UNEXPECTED_ERROR, "Cannot create db directory, " + std::string(ex.what()));
+            } catch (...) {
+                return Status(SERVER_UNEXPECTED_ERROR, "Cannot create db directory");
+            }
+
+            s = InstanceLockCheck::Check(config.storage.path());
+            if (!s.ok()) {
+                if (not cluster_enable) {
+                    std::cerr << "single instance lock db path failed." << s.message() << std::endl;
+                } else {
+                    std::cerr << cluster_role << " instance lock db path failed." << s.message() << std::endl;
+                }
+                return s;
+            }
+
+            if (config.wal.enable()) {
+                std::string wal_path = config.wal.path();
+
+                try {
+                    // True if a new directory was created, otherwise false.
+                    boost::filesystem::create_directories(wal_path);
+                } catch (...) {
+                    return Status(SERVER_UNEXPECTED_ERROR, "Cannot create wal directory");
+                }
+                s = InstanceLockCheck::Check(wal_path);
+                if (!s.ok()) {
+                    if (not cluster_enable) {
+                        std::cerr << "single instance lock wal path failed." << s.message() << std::endl;
+                    } else {
+                        std::cerr << cluster_role << " instance lock wal path failed." << s.message() << std::endl;
+                    }
+                    return s;
+                }
+            }
+        }
 
         // print version information
-        SERVER_LOG_INFO << "Milvus " << BUILD_TYPE << " version: v" << MILVUS_VERSION << ", built at " << BUILD_TIME;
+        LOG_SERVER_INFO_ << "Milvus " << BUILD_TYPE << " version: v" << MILVUS_VERSION << ", built at " << BUILD_TIME;
+#ifdef MILVUS_GPU_VERSION
+        LOG_SERVER_INFO_ << "GPU edition";
+#else
+        LOG_SERVER_INFO_ << "CPU edition";
+#endif
+        STATUS_CHECK(StorageChecker::CheckStoragePermission());
+        STATUS_CHECK(CpuChecker::CheckCpuInstructionSet());
+#ifdef MILVUS_GPU_VERSION
+        STATUS_CHECK(GpuChecker::CheckGpuEnvironment());
+#endif
+        /* record config and hardware information into log */
+        LogConfigInFile(config_filename_);
+        LogCpuInfo();
+        LOG_SERVER_INFO_ << "\n\n"
+                         << std::string(15, '*') << "Config in memory" << std::string(15, '*') << "\n\n"
+                         << ConfigMgr::GetInstance().Dump();
 
         server::Metrics::GetInstance().Init();
         server::SystemInfo::GetInstance().Init();
 
-        StartService();
-        return Status::OK();
+        return StartService();
     } catch (std::exception& ex) {
         std::string str = "Milvus server encounter exception: " + std::string(ex.what());
         return Status(SERVER_UNEXPECTED_ERROR, str);
@@ -229,35 +326,105 @@ Server::Stop() {
 
 Status
 Server::LoadConfig() {
-    Config& config = Config::GetInstance();
-    Status s = config.LoadConfigFile(config_filename_);
-    if (!s.ok()) {
-        std::cerr << s.message() << std::endl;
-        return s;
-    }
+    // Config& config = Config::GetInstance();
+    // Status s = config.LoadConfigFile(config_filename_);
+    // if (!s.ok()) {
+    //     std::cerr << s.message() << std::endl;
+    //     return s;
+    // }
 
-    s = config.ValidateConfig();
-    if (!s.ok()) {
-        std::cerr << "Config check fail: " << s.message() << std::endl;
-        return s;
-    }
+    // config_mgr_ = std::make_shared<ConfigMgr>(config_filename_);
+    // try {
+    //     config_mgr_->Init();
+    //     config_mgr_->Load();
+    // } catch (std::exception &ex) {
+    //     std::cerr << "Load config file failed: " << ex.what() << std::endl;
+    //     return Status(SERVER_UNEXPECTED_ERROR, "LoadConfig failed.");
+    // }
+
+    // s = config.ValidateConfig();
+    // if (!s.ok()) {
+    //     std::cerr << "Config check fail: " << s.message() << std::endl;
+    //     return s;
+    // }
     return milvus::Status::OK();
 }
 
-void
+Status
 Server::StartService() {
-    engine::KnowhereResource::Initialize();
+    Status stat;
+    stat = engine::KnowhereResource::Initialize();
+    if (!stat.ok()) {
+        LOG_SERVER_ERROR_ << "KnowhereResource initialize fail: " << stat.message();
+        goto FAIL;
+    }
+
     scheduler::StartSchedulerService();
-    DBWrapper::GetInstance().StartService();
+
+    stat = DBWrapper::GetInstance().StartService();
+    if (!stat.ok()) {
+        LOG_SERVER_ERROR_ << "DBWrapper start service fail: " << stat.message();
+        goto FAIL;
+    }
+
     grpc::GrpcServer::GetInstance().Start();
+    web::WebServer::GetInstance().Start();
+
+    // stat = storage::S3ClientWrapper::GetInstance().StartService();
+    // if (!stat.ok()) {
+    //     LOG_SERVER_ERROR_ << "S3Client start service fail: " << stat.message();
+    //     goto FAIL;
+    // }
+
+    return Status::OK();
+FAIL:
+    std::cerr << "Milvus initializes fail: " << stat.message() << std::endl;
+    return stat;
 }
 
 void
 Server::StopService() {
+    // storage::S3ClientWrapper::GetInstance().StopService();
+    web::WebServer::GetInstance().Stop();
     grpc::GrpcServer::GetInstance().Stop();
     DBWrapper::GetInstance().StopService();
     scheduler::StopSchedulerService();
     engine::KnowhereResource::Finalize();
+}
+
+void
+Server::LogConfigInFile(const std::string& path) {
+    // TODO(yhz): Check if file exists
+    auto node = YAML::LoadFile(path);
+    YAML::Emitter out;
+    out << node;
+    LOG_SERVER_INFO_ << "\n\n"
+                     << std::string(15, '*') << "Config in file" << std::string(15, '*') << "\n\n"
+                     << out.c_str();
+}
+
+void
+Server::LogCpuInfo() {
+    /*CPU information*/
+    std::fstream fcpu("/proc/cpuinfo", std::ios::in);
+    if (!fcpu.is_open()) {
+        LOG_SERVER_WARNING_ << "Cannot obtain CPU information. Open file /proc/cpuinfo fail: " << strerror(errno)
+                            << "(errno: " << errno << ")";
+        return;
+    }
+    std::stringstream cpu_info_ss;
+    cpu_info_ss << fcpu.rdbuf();
+    fcpu.close();
+    std::string cpu_info = cpu_info_ss.str();
+
+    auto processor_pos = cpu_info.rfind("processor");
+    if (std::string::npos == processor_pos) {
+        LOG_SERVER_WARNING_ << "Cannot obtain CPU information. No sub string \'processor\'";
+        return;
+    }
+
+    auto sub_str = cpu_info.substr(processor_pos);
+    LOG_SERVER_INFO_ << "\n\n" << std::string(15, '*') << "CPU" << std::string(15, '*') << "\n\n" << sub_str;
 }
 
 }  // namespace server

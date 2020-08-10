@@ -1,11 +1,13 @@
 ---
 name: "\U0001F41B Bug report"
 about: Create a bug report to help us improve Milvus
-title: "[BUG]"
+title: ''
 labels: ''
 assignees: ''
 
 ---
+
+**Please state you issue using the following template and, most importantly, in English.**
 
 **Describe the bug**
 A clear and concise description of what the bug is.

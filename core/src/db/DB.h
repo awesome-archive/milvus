@@ -1,40 +1,41 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
-#include "Options.h"
-#include "Types.h"
-#include "meta/Meta.h"
-#include "utils/Status.h"
-
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include "db/Options.h"
+#include "db/SimpleWaitNotify.h"
+#include "db/SnapshotHandlers.h"
+#include "db/insert/MemManager.h"
+#include "db/merge/MergeManager.h"
+#include "db/snapshot/Context.h"
+#include "db/snapshot/ResourceTypes.h"
+#include "db/snapshot/Resources.h"
+#include "utils/Json.h"
+#include "utils/Status.h"
 
 namespace milvus {
 namespace engine {
 
-class Env;
-
 class DB {
  public:
     DB() = default;
+
     DB(const DB&) = delete;
+
     DB&
     operator=(const DB&) = delete;
 
@@ -42,54 +43,83 @@ class DB {
 
     virtual Status
     Start() = 0;
+
     virtual Status
     Stop() = 0;
 
     virtual Status
-    CreateTable(meta::TableSchema& table_schema_) = 0;
-    virtual Status
-    DeleteTable(const std::string& table_id, const meta::DatesT& dates) = 0;
-    virtual Status
-    DescribeTable(meta::TableSchema& table_schema_) = 0;
-    virtual Status
-    HasTable(const std::string& table_id, bool& has_or_not_) = 0;
-    virtual Status
-    AllTables(std::vector<meta::TableSchema>& table_schema_array) = 0;
-    virtual Status
-    GetTableRowCount(const std::string& table_id, uint64_t& row_count) = 0;
-    virtual Status
-    PreloadTable(const std::string& table_id) = 0;
-    virtual Status
-    UpdateTableFlag(const std::string& table_id, int64_t flag) = 0;
+    CreateCollection(const snapshot::CreateCollectionContext& context) = 0;
 
     virtual Status
-    InsertVectors(const std::string& table_id_, uint64_t n, const float* vectors, IDNumbers& vector_ids_) = 0;
+    DropCollection(const std::string& name) = 0;
 
     virtual Status
-    Query(const std::string& table_id, uint64_t k, uint64_t nq, uint64_t nprobe, const float* vectors,
-          ResultIds& result_ids, ResultDistances& result_distances) = 0;
+    HasCollection(const std::string& collection_name, bool& has_or_not) = 0;
 
     virtual Status
-    Query(const std::string& table_id, uint64_t k, uint64_t nq, uint64_t nprobe, const float* vectors,
-          const meta::DatesT& dates, ResultIds& result_ids, ResultDistances& result_distances) = 0;
+    ListCollections(std::vector<std::string>& names) = 0;
 
     virtual Status
-    Query(const std::string& table_id, const std::vector<std::string>& file_ids, uint64_t k, uint64_t nq,
-          uint64_t nprobe, const float* vectors, const meta::DatesT& dates, ResultIds& result_ids,
-          ResultDistances& result_distances) = 0;
+    GetCollectionInfo(const std::string& collection_name, snapshot::CollectionPtr& collection,
+                      snapshot::FieldElementMappings& fields_schema) = 0;
 
     virtual Status
-    Size(uint64_t& result) = 0;
+    GetCollectionStats(const std::string& collection_name, milvus::json& collection_stats) = 0;
 
     virtual Status
-    CreateIndex(const std::string& table_id, const TableIndex& index) = 0;
-    virtual Status
-    DescribeIndex(const std::string& table_id, TableIndex& index) = 0;
-    virtual Status
-    DropIndex(const std::string& table_id) = 0;
+    CountEntities(const std::string& collection_name, int64_t& row_count) = 0;
 
     virtual Status
-    DropAll() = 0;
+    CreatePartition(const std::string& collection_name, const std::string& partition_name) = 0;
+
+    virtual Status
+    DropPartition(const std::string& collection_name, const std::string& partition_name) = 0;
+
+    virtual Status
+    HasPartition(const std::string& collection_name, const std::string& partition_tag, bool& exist) = 0;
+
+    virtual Status
+    ListPartitions(const std::string& collection_name, std::vector<std::string>& partition_names) = 0;
+
+    virtual Status
+    CreateIndex(const server::ContextPtr& context, const std::string& collection_id, const std::string& field_name,
+                const CollectionIndex& index) = 0;
+
+    virtual Status
+    DropIndex(const std::string& collection_name, const std::string& field_name = "") = 0;
+
+    virtual Status
+    DescribeIndex(const std::string& collection_name, const std::string& field_name, CollectionIndex& index) = 0;
+
+    virtual Status
+    Insert(const std::string& collection_name, const std::string& partition_name, DataChunkPtr& data_chunk) = 0;
+
+    virtual Status
+    GetEntityByID(const std::string& collection_name, const IDNumbers& id_array,
+                  const std::vector<std::string>& field_names, std::vector<bool>& valid_row,
+                  DataChunkPtr& data_chunk) = 0;
+
+    virtual Status
+    DeleteEntityByID(const std::string& collection_name, const engine::IDNumbers& entity_ids) = 0;
+
+    virtual Status
+    ListIDInSegment(const std::string& collection_id, int64_t segment_id, IDNumbers& entity_ids) = 0;
+
+    virtual Status
+    Query(const server::ContextPtr& context, const query::QueryPtr& query_ptr, engine::QueryResultPtr& result) = 0;
+
+    virtual Status
+    LoadCollection(const server::ContextPtr& context, const std::string& collection_name,
+                   const std::vector<std::string>& field_names, bool force = false) = 0;
+
+    virtual Status
+    Flush(const std::string& collection_name) = 0;
+
+    virtual Status
+    Flush() = 0;
+
+    virtual Status
+    Compact(const server::ContextPtr& context, const std::string& collection_name, double threshold = 0.0) = 0;
 };  // DB
 
 using DBPtr = std::shared_ptr<DB>;

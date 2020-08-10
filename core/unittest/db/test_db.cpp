@@ -1,568 +1,1283 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#include "db/utils.h"
-#include "db/DB.h"
-#include "db/DBImpl.h"
-#include "db/Constants.h"
-#include "db/meta/MetaConsts.h"
-#include "db/DBFactory.h"
-#include "cache/CpuCacheMgr.h"
-#include "utils/CommonUtil.h"
-#include "server/Config.h"
-
+#include <fiu-control.h>
+#include <fiu-local.h>
 #include <gtest/gtest.h>
-#include <boost/filesystem.hpp>
-#include <thread>
-#include <random>
 
+#include <algorithm>
+#include <set>
+#include <string>
+#include <experimental/filesystem>
+
+#include "db/SnapshotUtils.h"
+#include "db/SnapshotVisitor.h"
+#include "db/snapshot/IterateHandler.h"
+#include "db/snapshot/ResourceHelper.h"
+#include "db/utils.h"
+#include "knowhere/index/vector_index/helpers/IndexParameter.h"
+#include "segment/Segment.h"
+
+using SegmentVisitor = milvus::engine::SegmentVisitor;
 
 namespace {
+const char* VECTOR_FIELD_NAME = "vector";
 
-static const char *TABLE_NAME = "test_group";
-static constexpr int64_t TABLE_DIM = 256;
-static constexpr int64_t VECTOR_COUNT = 25000;
-static constexpr int64_t INSERT_LOOP = 1000;
-static constexpr int64_t SECONDS_EACH_HOUR = 3600;
-static constexpr int64_t DAY_SECONDS = 24 * 60 * 60;
+milvus::Status
+CreateCollection(const std::shared_ptr<DBImpl>& db, const std::string& collection_name, const LSN_TYPE& lsn) {
+    CreateCollectionContext context;
+    context.lsn = lsn;
+    auto collection_schema = std::make_shared<Collection>(collection_name);
+    context.collection = collection_schema;
+    auto vector_field = std::make_shared<Field>(VECTOR_FIELD_NAME, 0, milvus::engine::DataType::VECTOR_FLOAT);
+    auto vector_field_element =
+        std::make_shared<FieldElement>(0, 0, "ivfsq8", milvus::engine::FieldElementType::FET_INDEX);
+    auto int_field = std::make_shared<Field>("int", 0, milvus::engine::DataType::INT32);
+    context.fields_schema[vector_field] = {vector_field_element};
+    context.fields_schema[int_field] = {};
 
-milvus::engine::meta::TableSchema
-BuildTableSchema() {
-    milvus::engine::meta::TableSchema table_info;
-    table_info.dimension_ = TABLE_DIM;
-    table_info.table_id_ = TABLE_NAME;
-    return table_info;
+    return db->CreateCollection(context);
+}
+
+static constexpr int64_t COLLECTION_DIM = 128;
+
+milvus::Status
+CreateCollection2(std::shared_ptr<DBImpl> db, const std::string& collection_name, const LSN_TYPE& lsn) {
+    CreateCollectionContext context;
+    context.lsn = lsn;
+    auto collection_schema = std::make_shared<Collection>(collection_name);
+    context.collection = collection_schema;
+
+    milvus::json params;
+    params[milvus::knowhere::meta::DIM] = COLLECTION_DIM;
+    auto vector_field = std::make_shared<Field>(VECTOR_FIELD_NAME, 0, milvus::engine::DataType::VECTOR_FLOAT, params);
+    context.fields_schema[vector_field] = {};
+
+    std::unordered_map<std::string, milvus::engine::DataType> attr_type = {
+        {"field_0", milvus::engine::DataType::INT32},
+        {"field_1", milvus::engine::DataType::INT64},
+        {"field_2", milvus::engine::DataType::DOUBLE},
+    };
+
+    std::vector<std::string> field_names;
+    for (auto& pair : attr_type) {
+        auto field = std::make_shared<Field>(pair.first, 0, pair.second);
+        context.fields_schema[field] = {};
+        field_names.push_back(pair.first);
+    }
+
+    return db->CreateCollection(context);
+}
+
+milvus::Status
+CreateCollection3(std::shared_ptr<DBImpl> db, const std::string& collection_name, const LSN_TYPE& lsn) {
+    CreateCollectionContext context;
+    context.lsn = lsn;
+    auto collection_schema = std::make_shared<Collection>(collection_name);
+    context.collection = collection_schema;
+
+    milvus::json params;
+    params[milvus::knowhere::meta::DIM] = COLLECTION_DIM;
+    auto vector_field = std::make_shared<Field>("float_vector", 0, milvus::engine::DataType::VECTOR_FLOAT, params);
+    context.fields_schema[vector_field] = {};
+
+    std::unordered_map<std::string, milvus::engine::DataType> attr_type = {
+        {"int64", milvus::engine::DataType::INT64},
+    };
+
+    std::vector<std::string> field_names;
+    for (auto& pair : attr_type) {
+        auto field = std::make_shared<Field>(pair.first, 0, pair.second);
+        context.fields_schema[field] = {};
+        field_names.push_back(pair.first);
+    }
+
+    return db->CreateCollection(context);
 }
 
 void
-BuildVectors(int64_t n, std::vector<float> &vectors) {
-    vectors.clear();
-    vectors.resize(n * TABLE_DIM);
-    float *data = vectors.data();
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < TABLE_DIM; j++) data[TABLE_DIM * i + j] = drand48();
-        data[TABLE_DIM * i] += i / 2000.;
+BuildEntities(uint64_t n, uint64_t batch_index, milvus::engine::DataChunkPtr& data_chunk) {
+    data_chunk = std::make_shared<milvus::engine::DataChunk>();
+    data_chunk->count_ = n;
+
+    milvus::engine::VectorsData vectors;
+    vectors.vector_count_ = n;
+    vectors.float_data_.clear();
+    vectors.float_data_.resize(n * COLLECTION_DIM);
+    float* data = vectors.float_data_.data();
+    for (uint64_t i = 0; i < n; i++) {
+        for (int64_t j = 0; j < COLLECTION_DIM; j++) data[COLLECTION_DIM * i + j] = drand48();
+        data[COLLECTION_DIM * i] += i / 2000.;
+
+        vectors.id_array_.push_back(n * batch_index + i);
     }
-}
 
-std::string
-CurrentTmDate(int64_t offset_day = 0) {
-    time_t tt;
-    time(&tt);
-    tt = tt + 8 * SECONDS_EACH_HOUR;
-    tt = tt + 24 * SECONDS_EACH_HOUR * offset_day;
-    tm t;
-    gmtime_r(&tt, &t);
+    milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+    raw->data_.resize(vectors.float_data_.size() * sizeof(float));
+    memcpy(raw->data_.data(), vectors.float_data_.data(), vectors.float_data_.size() * sizeof(float));
+    data_chunk->fixed_fields_[VECTOR_FIELD_NAME] = raw;
 
-    std::string str = std::to_string(t.tm_year + 1900) + "-" + std::to_string(t.tm_mon + 1)
-        + "-" + std::to_string(t.tm_mday);
+    std::vector<int32_t> value_0;
+    std::vector<int64_t> value_1;
+    std::vector<double> value_2;
+    value_0.resize(n);
+    value_1.resize(n);
+    value_2.resize(n);
 
-    return str;
+    std::default_random_engine e;
+    std::uniform_real_distribution<double> u(0, 1);
+    for (uint64_t i = 0; i < n; ++i) {
+        value_0[i] = i;
+        value_1[i] = i + n;
+        value_2[i] = u(e);
+    }
+
+    {
+        milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+        raw->data_.resize(value_0.size() * sizeof(int32_t));
+        memcpy(raw->data_.data(), value_0.data(), value_0.size() * sizeof(int32_t));
+        data_chunk->fixed_fields_["field_0"] = raw;
+    }
+
+    {
+        milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+        raw->data_.resize(value_1.size() * sizeof(int64_t));
+        memcpy(raw->data_.data(), value_1.data(), value_1.size() * sizeof(int64_t));
+        data_chunk->fixed_fields_["field_1"] = raw;
+    }
+
+    {
+        milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+        raw->data_.resize(value_2.size() * sizeof(double));
+        memcpy(raw->data_.data(), value_2.data(), value_2.size() * sizeof(double));
+        data_chunk->fixed_fields_["field_2"] = raw;
+    }
 }
 
 void
-ConvertTimeRangeToDBDates(const std::string &start_value,
-                          const std::string &end_value,
-                          std::vector<milvus::engine::meta::DateT> &dates) {
-    dates.clear();
+BuildQueryPtr(const std::string& collection_name, int64_t n, int64_t topk, std::vector<std::string>& field_names,
+              std::vector<std::string>& partitions, milvus::query::QueryPtr& query_ptr) {
+    auto general_query = std::make_shared<milvus::query::GeneralQuery>();
+    query_ptr->collection_id = collection_name;
+    query_ptr->field_names = field_names;
+    query_ptr->partitions = partitions;
+    std::set<std::string> index_fields = {"int64", "float_vector"};
+    query_ptr->index_fields = index_fields;
 
-    time_t tt_start, tt_end;
-    tm tm_start, tm_end;
-    if (!milvus::server::CommonUtil::TimeStrToTime(start_value, tt_start, tm_start)) {
-        return;
+    auto left_query = std::make_shared<milvus::query::GeneralQuery>();
+    auto term_query = std::make_shared<milvus::query::TermQuery>();
+    std::vector<int32_t> term_value(n, 0);
+    for (uint64_t i = 0; i < n; i++) {
+        term_value[i] = i;
     }
+    term_query->json_obj = {{"int64", {{"values", term_value}}}};
+    std::cout << term_query->json_obj.dump() << std::endl;
+    left_query->leaf = std::make_shared<milvus::query::LeafQuery>();
+    left_query->leaf->term_query = term_query;
+    general_query->bin->left_query = left_query;
 
-    if (!milvus::server::CommonUtil::TimeStrToTime(end_value, tt_end, tm_end)) {
-        return;
+    auto right_query = std::make_shared<milvus::query::GeneralQuery>();
+    right_query->leaf = std::make_shared<milvus::query::LeafQuery>();
+    std::string placeholder = "placeholder_1";
+    right_query->leaf->vector_placeholder = placeholder;
+    general_query->bin->right_query = right_query;
+
+    auto vector_query = std::make_shared<milvus::query::VectorQuery>();
+    vector_query->field_name = "float_vector";
+    vector_query->topk = topk;
+    milvus::query::VectorRecord vector_record;
+    vector_record.float_data.resize(n * COLLECTION_DIM);
+    for (uint64_t i = 0; i < n; i++) {
+        for (int64_t j = 0; j < COLLECTION_DIM; j++) vector_record.float_data[COLLECTION_DIM * i + j] = drand48();
+        vector_record.float_data[COLLECTION_DIM * i] += i / 2000.;
     }
+    vector_query->query_vector = vector_record;
+    vector_query->metric_type = "L2";
+    vector_query->extra_params = {{"nprobe", 1024}};
 
-    int64_t days = (tt_end > tt_start) ? (tt_end - tt_start) / DAY_SECONDS : (tt_start - tt_end) /
-        DAY_SECONDS;
-    if (days == 0) {
-        return;
-    }
-
-    for (int64_t i = 0; i < days; i++) {
-        time_t tt_day = tt_start + DAY_SECONDS * i;
-        tm tm_day;
-        milvus::server::CommonUtil::ConvertTime(tt_day, tm_day);
-
-        int64_t date = tm_day.tm_year * 10000 + tm_day.tm_mon * 100 +
-            tm_day.tm_mday;//according to db logic
-        dates.push_back(date);
-    }
+    query_ptr->root = general_query;
+    query_ptr->vectors.insert(std::make_pair(placeholder, vector_query));
+    query_ptr->metric_types.insert({"float_vector", "L2"});
+    general_query->bin->relation = milvus::query::QueryRelation::AND;
 }
 
-} // namespace
+void
+BuildEntities2(uint64_t n, uint64_t batch_index, milvus::engine::DataChunkPtr& data_chunk) {
+    data_chunk = std::make_shared<milvus::engine::DataChunk>();
+    data_chunk->count_ = n;
 
-TEST_F(DBTest, CONFIG_TEST) {
-    {
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf("wrong"));
-        /* EXPECT_DEATH(engine::ArchiveConf conf("wrong"), ""); */
+    milvus::engine::VectorsData vectors;
+    vectors.vector_count_ = n;
+    vectors.float_data_.clear();
+    vectors.float_data_.resize(n * COLLECTION_DIM);
+    float* data = vectors.float_data_.data();
+    for (uint64_t i = 0; i < n; i++) {
+        for (int64_t j = 0; j < COLLECTION_DIM; j++) data[COLLECTION_DIM * i + j] = drand48();
+        data[COLLECTION_DIM * i] += i / 2000.;
+
+        vectors.id_array_.push_back(n * batch_index + i);
     }
-    {
-        milvus::engine::ArchiveConf conf("delete");
-        ASSERT_EQ(conf.GetType(), "delete");
-        auto criterias = conf.GetCriterias();
-        ASSERT_EQ(criterias.size(), 0);
+
+    milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+    data_chunk->fixed_fields_["float_vector"] = raw;
+    raw->data_.resize(vectors.float_data_.size() * sizeof(float));
+    memcpy(raw->data_.data(), vectors.float_data_.data(), vectors.float_data_.size() * sizeof(float));
+
+    std::vector<int64_t> value_1;
+    value_1.resize(n);
+
+    for (uint64_t i = 0; i < n; ++i) {
+        value_1[i] = i;
     }
+
     {
-        milvus::engine::ArchiveConf conf("swap");
-        ASSERT_EQ(conf.GetType(), "swap");
-        auto criterias = conf.GetCriterias();
-        ASSERT_EQ(criterias.size(), 0);
-    }
-    {
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf1("swap", "disk:"));
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf2("swap", "disk:a"));
-        milvus::engine::ArchiveConf conf("swap", "disk:1024");
-        auto criterias = conf.GetCriterias();
-        ASSERT_EQ(criterias.size(), 1);
-        ASSERT_EQ(criterias["disk"], 1024);
-    }
-    {
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf1("swap", "days:"));
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf2("swap", "days:a"));
-        milvus::engine::ArchiveConf conf("swap", "days:100");
-        auto criterias = conf.GetCriterias();
-        ASSERT_EQ(criterias.size(), 1);
-        ASSERT_EQ(criterias["days"], 100);
-    }
-    {
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf1("swap", "days:"));
-        ASSERT_ANY_THROW(milvus::engine::ArchiveConf conf2("swap", "days:a"));
-        milvus::engine::ArchiveConf conf("swap", "days:100;disk:200");
-        auto criterias = conf.GetCriterias();
-        ASSERT_EQ(criterias.size(), 2);
-        ASSERT_EQ(criterias["days"], 100);
-        ASSERT_EQ(criterias["disk"], 200);
+        milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+        data_chunk->fixed_fields_["int64"] = raw;
+        raw->data_.resize(value_1.size() * sizeof(int64_t));
+        memcpy(raw->data_.data(), value_1.data(), value_1.size() * sizeof(int64_t));
     }
 }
+}  // namespace
 
-TEST_F(DBTest, DB_TEST) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
+TEST_F(DBTest, CollectionTest) {
+    LSN_TYPE lsn = 0;
+    auto next_lsn = [&]() -> decltype(lsn) {
+        return ++lsn;
+    };
+    std::string c1 = "c1";
+    auto status = CreateCollection(db_, c1, next_lsn());
+    ASSERT_TRUE(status.ok());
 
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_EQ(table_info_get.dimension_, TABLE_DIM);
+    ScopedSnapshotT ss;
+    status = Snapshots::GetInstance().GetSnapshot(ss, c1);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(ss);
+    ASSERT_EQ(ss->GetName(), c1);
 
-    milvus::engine::IDNumbers vector_ids;
-    milvus::engine::IDNumbers target_ids;
+    bool has;
+    status = db_->HasCollection(c1, has);
+    ASSERT_TRUE(has);
+    ASSERT_TRUE(status.ok());
 
-    int64_t nb = 50;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
+    ASSERT_EQ(ss->GetCollectionCommit()->GetRowCount(), 0);
+    int64_t row_cnt = 0;
+    status = db_->CountEntities(c1, row_cnt);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(row_cnt, 0);
 
-    int64_t qb = 5;
-    std::vector<float> qxb;
-    BuildVectors(qb, qxb);
+    std::vector<std::string> names;
+    status = db_->ListCollections(names);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(names.size(), 1);
+    ASSERT_EQ(names[0], c1);
 
-    std::thread search([&]() {
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        int k = 10;
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::string c1_1 = "c1";
+    status = CreateCollection(db_, c1_1, next_lsn());
+    ASSERT_FALSE(status.ok());
 
-        INIT_TIMER;
-        std::stringstream ss;
-        uint64_t count = 0;
-        uint64_t prev_count = 0;
+    std::string c2 = "c2";
+    status = CreateCollection(db_, c2, next_lsn());
+    ASSERT_TRUE(status.ok());
 
-        for (auto j = 0; j < 10; ++j) {
-            ss.str("");
-            db_->Size(count);
-            prev_count = count;
+    status = db_->ListCollections(names);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(names.size(), 2);
 
-            START_TIMER;
-            stat = db_->Query(TABLE_NAME, k, qb, 10, qxb.data(), result_ids, result_distances);
-            ss << "Search " << j << " With Size " << count / milvus::engine::M << " M";
-            STOP_TIMER(ss.str());
+    status = db_->DropCollection(c1);
+    ASSERT_TRUE(status.ok());
 
-            ASSERT_TRUE(stat.ok());
-            for (auto i = 0; i < qb; ++i) {
-                ASSERT_EQ(result_ids[i*k], target_ids[i]);
-                ss.str("");
-                ss << "Result [" << i << "]:";
-                for (auto t = 0; t < k; t++) {
-                    ss << result_ids[i * k + t] << " ";
+    status = db_->ListCollections(names);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(names.size(), 1);
+    ASSERT_EQ(names[0], c2);
+
+    status = db_->DropCollection(c1);
+    ASSERT_FALSE(status.ok());
+}
+
+TEST_F(DBTest, PartitionTest) {
+    LSN_TYPE lsn = 0;
+    auto next_lsn = [&]() -> decltype(lsn) {
+        return ++lsn;
+    };
+    std::string c1 = "c1";
+    auto status = CreateCollection(db_, c1, next_lsn());
+    ASSERT_TRUE(status.ok());
+
+    std::vector<std::string> partition_names;
+    status = db_->ListPartitions(c1, partition_names);
+    ASSERT_EQ(partition_names.size(), 1);
+    ASSERT_EQ(partition_names[0], "_default");
+
+    std::string p1 = "p1";
+    std::string c2 = "c2";
+    status = db_->CreatePartition(c2, p1);
+    ASSERT_FALSE(status.ok());
+
+    status = db_->CreatePartition(c1, p1);
+    ASSERT_TRUE(status.ok());
+
+    status = db_->ListPartitions(c1, partition_names);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(partition_names.size(), 2);
+
+    status = db_->CreatePartition(c1, p1);
+    ASSERT_FALSE(status.ok());
+
+    status = db_->DropPartition(c1, "p3");
+    ASSERT_FALSE(status.ok());
+
+    status = db_->DropPartition(c1, p1);
+    ASSERT_TRUE(status.ok());
+    status = db_->ListPartitions(c1, partition_names);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(partition_names.size(), 1);
+}
+
+TEST_F(DBTest, VisitorTest) {
+    LSN_TYPE lsn = 0;
+    auto next_lsn = [&]() -> decltype(lsn) {
+        return ++lsn;
+    };
+
+    std::string c1 = "c1";
+    auto status = CreateCollection(db_, c1, next_lsn());
+    ASSERT_TRUE(status.ok());
+
+    std::stringstream p_name;
+    auto num = RandomInt(1, 3);
+    for (auto i = 0; i < num; ++i) {
+        p_name.str("");
+        p_name << "partition_" << i;
+        status = db_->CreatePartition(c1, p_name.str());
+        ASSERT_TRUE(status.ok());
+    }
+
+    ScopedSnapshotT ss;
+    status = Snapshots::GetInstance().GetSnapshot(ss, c1);
+    ASSERT_TRUE(status.ok());
+
+    SegmentFileContext sf_context;
+    SFContextBuilder(sf_context, ss);
+
+    auto new_total = 0;
+    auto& partitions = ss->GetResources<Partition>();
+    ID_TYPE partition_id;
+    for (auto& kv : partitions) {
+        num = RandomInt(1, 3);
+        auto row_cnt = 100;
+        for (auto i = 0; i < num; ++i) {
+            ASSERT_TRUE(CreateSegment(ss, kv.first, next_lsn(), sf_context, row_cnt).ok());
+        }
+        new_total += num;
+        partition_id = kv.first;
+    }
+
+    status = Snapshots::GetInstance().GetSnapshot(ss, c1);
+    ASSERT_TRUE(status.ok());
+
+    auto executor = [&](const Segment::Ptr& segment, SegmentIterator* handler) -> Status {
+        auto visitor = SegmentVisitor::Build(ss, segment->GetID());
+        if (!visitor) {
+            return Status(milvus::SS_ERROR, "Cannot build segment visitor");
+        }
+        std::cout << visitor->ToString() << std::endl;
+        return Status::OK();
+    };
+
+    auto segment_handler = std::make_shared<SegmentIterator>(ss, executor);
+    segment_handler->Iterate();
+    std::cout << segment_handler->GetStatus().ToString() << std::endl;
+    ASSERT_TRUE(segment_handler->GetStatus().ok());
+
+    auto row_cnt = ss->GetCollectionCommit()->GetRowCount();
+    auto new_segment_row_cnt = 1024;
+    {
+        OperationContext context;
+        context.lsn = next_lsn();
+        context.prev_partition = ss->GetResource<Partition>(partition_id);
+        auto op = std::make_shared<NewSegmentOperation>(context, ss);
+        SegmentPtr new_seg;
+        status = op->CommitNewSegment(new_seg);
+        ASSERT_TRUE(status.ok());
+        SegmentFilePtr seg_file;
+        auto nsf_context = sf_context;
+        nsf_context.segment_id = new_seg->GetID();
+        nsf_context.partition_id = new_seg->GetPartitionId();
+        status = op->CommitNewSegmentFile(nsf_context, seg_file);
+        ASSERT_TRUE(status.ok());
+        auto ctx = op->GetContext();
+        ASSERT_TRUE(ctx.new_segment);
+        auto visitor = SegmentVisitor::Build(ss, ctx.new_segment, ctx.new_segment_files);
+        ASSERT_TRUE(visitor);
+        ASSERT_EQ(visitor->GetSegment(), new_seg);
+        ASSERT_FALSE(visitor->GetSegment()->IsActive());
+
+        int file_num = 0;
+        auto field_visitors = visitor->GetFieldVisitors();
+        for (auto& kv : field_visitors) {
+            auto& field_visitor = kv.second;
+            auto field_element_visitors = field_visitor->GetElementVistors();
+            for (auto& kkvv : field_element_visitors) {
+                auto& field_element_visitor = kkvv.second;
+                auto file = field_element_visitor->GetFile();
+                if (file) {
+                    file_num++;
+                    ASSERT_FALSE(file->IsActive());
                 }
-                /* LOG(DEBUG) << ss.str(); */
             }
-            ASSERT_TRUE(count >= prev_count);
-            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-    });
+        ASSERT_EQ(file_num, 1);
 
-    int loop = INSERT_LOOP;
+        std::cout << visitor->ToString() << std::endl;
+        status = op->CommitRowCount(new_segment_row_cnt);
+        status = op->Push();
+        ASSERT_TRUE(status.ok());
+    }
+    status = Snapshots::GetInstance().GetSnapshot(ss, c1);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(ss->GetCollectionCommit()->GetRowCount(), row_cnt + new_segment_row_cnt);
+    std::cout << ss->ToString() << std::endl;
+}
 
-    for (auto i = 0; i < loop; ++i) {
-        if (i == 40) {
-            db_->InsertVectors(TABLE_NAME, qb, qxb.data(), target_ids);
-            ASSERT_EQ(target_ids.size(), qb);
+TEST_F(DBTest, QueryTest) {
+    LSN_TYPE lsn = 0;
+    auto next_lsn = [&]() -> decltype(lsn) {
+        return ++lsn;
+    };
+
+    std::string c1 = "c1";
+    auto status = CreateCollection3(db_, c1, next_lsn());
+    ASSERT_TRUE(status.ok());
+
+    const uint64_t entity_count = 10000;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities2(entity_count, 0, data_chunk);
+
+    status = db_->Insert(c1, "", data_chunk);
+    ASSERT_TRUE(status.ok());
+
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    milvus::server::ContextPtr ctx1;
+    milvus::query::QueryPtr query_ptr = std::make_shared<milvus::query::Query>();
+    milvus::engine::QueryResultPtr result = std::make_shared<milvus::engine::QueryResult>();
+
+    std::vector<std::string> field_names;
+    std::vector<std::string> partitions;
+    int64_t nq = 5;
+    int64_t topk = 10;
+    BuildQueryPtr(c1, nq, topk, field_names, partitions, query_ptr);
+    status = db_->Query(ctx1, query_ptr, result);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(result->row_num_, nq);
+}
+
+TEST_F(DBTest, InsertTest) {
+    auto do_insert = [&](bool autogen_id, bool provide_id) -> void {
+        CreateCollectionContext context;
+        context.lsn = 0;
+        std::string collection_name = "INSERT_TEST";
+        auto collection_schema = std::make_shared<Collection>(collection_name);
+        milvus::json params;
+        params[milvus::engine::PARAM_UID_AUTOGEN] = autogen_id;
+        collection_schema->SetParams(params);
+        context.collection = collection_schema;
+
+        std::string field_name = "field_0";
+        auto field = std::make_shared<Field>(field_name, 0, milvus::engine::DataType::INT32);
+        context.fields_schema[field] = {};
+
+        field = std::make_shared<Field>(milvus::engine::FIELD_UID, 0, milvus::engine::DataType::INT64);
+        context.fields_schema[field] = {};
+
+        auto status = db_->CreateCollection(context);
+
+        milvus::engine::DataChunkPtr data_chunk = std::make_shared<milvus::engine::DataChunk>();
+        data_chunk->count_ = 100;
+        if (provide_id) {
+            milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+            raw->data_.resize(100 * sizeof(int64_t));
+            int64_t* p = (int64_t*)raw->data_.data();
+            for (auto i = 0; i < data_chunk->count_; ++i) {
+                p[i] = i;
+            }
+            data_chunk->fixed_fields_[milvus::engine::FIELD_UID] = raw;
+        }
+        {
+            milvus::engine::BinaryDataPtr raw = std::make_shared<milvus::engine::BinaryData>();
+            raw->data_.resize(100 * sizeof(int32_t));
+            int32_t* p = (int32_t*)raw->data_.data();
+            for (auto i = 0; i < data_chunk->count_; ++i) {
+                p[i] = i + 5000;
+            }
+            data_chunk->fixed_fields_[field_name] = raw;
+        }
+
+        status = db_->Insert(collection_name, "", data_chunk);
+        if (autogen_id == provide_id) {
+            ASSERT_FALSE(status.ok());
         } else {
-            db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
+            ASSERT_TRUE(status.ok());
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
-    }
 
-    search.join();
+        status = db_->Flush();
+        ASSERT_TRUE(status.ok());
 
-    uint64_t count;
-    stat = db_->GetTableRowCount(TABLE_NAME, count);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_GT(count, 0);
-}
-
-TEST_F(DBTest, SEARCH_TEST) {
-    std::string config_path(CONFIG_PATH);
-    config_path += CONFIG_FILE;
-    milvus::server::Config &config = milvus::server::Config::GetInstance();
-    milvus::Status s = config.LoadConfigFile(config_path);
-
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
-
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_EQ(table_info_get.dimension_, TABLE_DIM);
-
-    // prepare raw data
-    size_t nb = VECTOR_COUNT;
-    size_t nq = 10;
-    size_t k = 5;
-    std::vector<float> xb(nb * TABLE_DIM);
-    std::vector<float> xq(nq * TABLE_DIM);
-    std::vector<int64_t> ids(nb);
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis_xt(-1.0, 1.0);
-    for (size_t i = 0; i < nb * TABLE_DIM; i++) {
-        xb[i] = dis_xt(gen);
-        if (i < nb) {
-            ids[i] = i;
+        int64_t row_count = 0;
+        status = db_->CountEntities(collection_name, row_count);
+        ASSERT_TRUE(status.ok());
+        if (autogen_id == provide_id) {
+            ASSERT_EQ(row_count, 0);
+        } else {
+            ASSERT_EQ(row_count, data_chunk->count_);
         }
-    }
-    for (size_t i = 0; i < nq * TABLE_DIM; i++) {
-        xq[i] = dis_xt(gen);
-    }
 
-    // result data
-    //std::vector<long> nns_gt(k*nq);
-    std::vector<int64_t> nns(k * nq);  // nns = nearst neg search
-    //std::vector<float> dis_gt(k*nq);
-    std::vector<float> dis(k * nq);
+        status = db_->DropCollection(collection_name);
+        ASSERT_TRUE(status.ok());
+    };
 
-    // insert data
-    const int batch_size = 100;
-    for (int j = 0; j < nb / batch_size; ++j) {
-        stat = db_->InsertVectors(TABLE_NAME, batch_size, xb.data() + batch_size * j * TABLE_DIM, ids);
-        if (j == 200) { sleep(1); }
-        ASSERT_TRUE(stat.ok());
-    }
+    // create collection with auto-generate id, insert entities with user id, insert action failed
+    do_insert(true, true);
 
-    milvus::engine::TableIndex index;
-    index.engine_type_ = (int) milvus::engine::EngineType::FAISS_IDMAP;
-    db_->CreateIndex(TABLE_NAME, index); // wait until build index finish
+    // create collection with auto-generate id, insert entities without user id, insert action succeed
+    do_insert(true, false);
 
-    {
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        stat = db_->Query(TABLE_NAME, k, nq, 10, xq.data(), result_ids, result_distances);
-        ASSERT_TRUE(stat.ok());
-    }
+    // create collection without auto-generate id, insert entities with user id, insert action succeed
+    do_insert(false, true);
 
-    {//search by specify index file
-        milvus::engine::meta::DatesT dates;
-        std::vector<std::string> file_ids = {"1", "2", "3", "4", "5", "6"};
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        stat = db_->Query(TABLE_NAME, file_ids, k, nq, 10, xq.data(), dates, result_ids, result_distances);
-        ASSERT_TRUE(stat.ok());
-    }
-
-#ifdef CUSTOMIZATION
-    //test FAISS_IVFSQ8H optimizer
-    index.engine_type_ = (int)milvus::engine::EngineType::FAISS_IVFSQ8H;
-    db_->CreateIndex(TABLE_NAME, index); // wait until build index finish
-
-    {
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        stat = db_->Query(TABLE_NAME, k, nq, 10, xq.data(), result_ids, result_distances);
-        ASSERT_TRUE(stat.ok());
-    }
-
-    {
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        stat = db_->Query(TABLE_NAME, k, 200, 10, xq.data(), result_ids, result_distances);
-        ASSERT_TRUE(stat.ok());
-    }
-
-    {//search by specify index file
-        milvus::engine::meta::DatesT dates;
-        std::vector<std::string> file_ids = {"1", "2", "3", "4", "5", "6"};
-        milvus::engine::ResultIds result_ids;
-        milvus::engine::ResultDistances result_distances;
-        stat = db_->Query(TABLE_NAME, file_ids, k, nq, 10, xq.data(), dates, result_ids, result_distances);
-        ASSERT_TRUE(stat.ok());
-    }
-
-
-#endif
+    // create collection without auto-generate id, insert entities without user id, insert action failed
+    do_insert(false, false);
 }
 
-TEST_F(DBTest, PRELOADTABLE_TEST) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
+TEST_F(DBTest, MergeTest) {
+    std::string collection_name = "MERGE_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok());
 
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_EQ(table_info_get.dimension_, TABLE_DIM);
+    const uint64_t entity_count = 100;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(entity_count, 0, data_chunk);
 
-    int64_t nb = VECTOR_COUNT;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
+    // insert entities into collection multiple times
+    int64_t repeat = 2;
+    for (int32_t i = 0; i < repeat; i++) {
+        status = db_->Insert(collection_name, "", data_chunk);
+        ASSERT_TRUE(status.ok());
 
-    int loop = 5;
-    for (auto i = 0; i < loop; ++i) {
-        milvus::engine::IDNumbers vector_ids;
-        db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
-        ASSERT_EQ(vector_ids.size(), nb);
+        data_chunk->fixed_fields_.erase(milvus::engine::FIELD_UID); // clear auto-generated id
+
+        status = db_->Flush();
+        ASSERT_TRUE(status.ok());
     }
 
-    milvus::engine::TableIndex index;
-    index.engine_type_ = (int) milvus::engine::EngineType::FAISS_IDMAP;
-    db_->CreateIndex(TABLE_NAME, index); // wait until build index finish
+    // wait to merge finished
+    sleep(2);
 
-    int64_t prev_cache_usage = milvus::cache::CpuCacheMgr::GetInstance()->CacheUsage();
-    stat = db_->PreloadTable(TABLE_NAME);
-    ASSERT_TRUE(stat.ok());
-    int64_t cur_cache_usage = milvus::cache::CpuCacheMgr::GetInstance()->CacheUsage();
-    ASSERT_TRUE(prev_cache_usage < cur_cache_usage);
-}
+    // validate entities count
+    int64_t row_count = 0;
+    status = db_->CountEntities(collection_name, row_count);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(row_count, entity_count * repeat);
 
-TEST_F(DBTest, SHUTDOWN_TEST) {
-    db_->Stop();
+    // validate segment files count is correct
+    ScopedSnapshotT ss;
+    status = Snapshots::GetInstance().GetSnapshot(ss, collection_name);
+    ASSERT_TRUE(status.ok());
+    std::cout << ss->ToString() << std::endl;
 
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
-    ASSERT_FALSE(stat.ok());
+    auto root_path = GetOptions().meta_.path_ + milvus::engine::COLLECTIONS_FOLDER;
+    std::vector<std::string> segment_paths;
 
-    stat = db_->DescribeTable(table_info);
-    ASSERT_FALSE(stat.ok());
+    auto seg_executor = [&](const SegmentPtr& segment, SegmentIterator* handler) -> Status {
+        std::string res_path = milvus::engine::snapshot::GetResPath<Segment>(root_path, segment);
+        std::cout << res_path << std::endl;
+        if (!std::experimental::filesystem::is_directory(res_path)) {
+            return Status(milvus::SS_ERROR, res_path + " not exist");
+        }
+        segment_paths.push_back(res_path);
+        return Status::OK();
+    };
+    auto segment_iter = std::make_shared<SegmentIterator>(ss, seg_executor);
+    segment_iter->Iterate();
+    status = segment_iter->GetStatus();
+    ASSERT_TRUE(status.ok()) << status.ToString();
 
-    bool has_table = false;
-    stat = db_->HasTable(table_info.table_id_, has_table);
-    ASSERT_FALSE(stat.ok());
+    std::set<std::string> segment_file_paths;
+    auto sf_executor = [&](const SegmentFilePtr& segment_file, SegmentFileIterator* handler) -> Status {
+        std::string res_path = milvus::engine::snapshot::GetResPath<SegmentFile>(root_path, segment_file);
+        if (std::experimental::filesystem::is_regular_file(res_path) ||
+            std::experimental::filesystem::is_regular_file(res_path +
+                milvus::codec::IdBloomFilterFormat::FilePostfix()) ||
+            std::experimental::filesystem::is_regular_file(res_path +
+                milvus::codec::DeletedDocsFormat::FilePostfix())) {
+            segment_file_paths.insert(res_path);
+            std::cout << res_path << std::endl;
+        }
+        return Status::OK();
+    };
+    auto sf_iterator = std::make_shared<SegmentFileIterator>(ss, sf_executor);
+    sf_iterator->Iterate();
 
-    milvus::engine::IDNumbers ids;
-    stat = db_->InsertVectors(table_info.table_id_, 0, nullptr, ids);
-    ASSERT_FALSE(stat.ok());
-
-    stat = db_->PreloadTable(table_info.table_id_);
-    ASSERT_FALSE(stat.ok());
-
-    uint64_t row_count = 0;
-    stat = db_->GetTableRowCount(table_info.table_id_, row_count);
-    ASSERT_FALSE(stat.ok());
-
-    milvus::engine::TableIndex index;
-    stat = db_->CreateIndex(table_info.table_id_, index);
-    ASSERT_FALSE(stat.ok());
-
-    stat = db_->DescribeIndex(table_info.table_id_, index);
-    ASSERT_FALSE(stat.ok());
-
-    milvus::engine::meta::DatesT dates;
-    milvus::engine::ResultIds result_ids;
-    milvus::engine::ResultDistances result_distances;
-    stat = db_->Query(table_info.table_id_, 1, 1, 1, nullptr, dates, result_ids, result_distances);
-    ASSERT_FALSE(stat.ok());
-    std::vector<std::string> file_ids;
-    stat = db_->Query(table_info.table_id_, file_ids, 1, 1, 1, nullptr, dates, result_ids, result_distances);
-    ASSERT_FALSE(stat.ok());
-
-    stat = db_->DeleteTable(table_info.table_id_, dates);
-    ASSERT_FALSE(stat.ok());
-}
-
-TEST_F(DBTest, INDEX_TEST) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
-
-    int64_t nb = VECTOR_COUNT;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
-
-    milvus::engine::IDNumbers vector_ids;
-    db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
-    ASSERT_EQ(vector_ids.size(), nb);
-
-    milvus::engine::TableIndex index;
-    index.engine_type_ = (int) milvus::engine::EngineType::FAISS_IVFSQ8;
-    index.metric_type_ = (int) milvus::engine::MetricType::IP;
-    stat = db_->CreateIndex(table_info.table_id_, index);
-    ASSERT_TRUE(stat.ok());
-
-    index.engine_type_ = (int) milvus::engine::EngineType::FAISS_IVFFLAT;
-    stat = db_->CreateIndex(table_info.table_id_, index);
-    ASSERT_TRUE(stat.ok());
-
-#ifdef CUSTOMIZATION
-    index.engine_type_ = (int)milvus::engine::EngineType::FAISS_IVFSQ8H;
-    stat = db_->CreateIndex(table_info.table_id_, index);
-    ASSERT_TRUE(stat.ok());
-#endif
-
-    milvus::engine::TableIndex index_out;
-    stat = db_->DescribeIndex(table_info.table_id_, index_out);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_EQ(index.engine_type_, index_out.engine_type_);
-    ASSERT_EQ(index.nlist_, index_out.nlist_);
-    ASSERT_EQ(table_info.metric_type_, index_out.metric_type_);
-
-    stat = db_->DropIndex(table_info.table_id_);
-    ASSERT_TRUE(stat.ok());
-}
-
-TEST_F(DBTest2, ARHIVE_DISK_CHECK) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
-
-    std::vector<milvus::engine::meta::TableSchema> table_schema_array;
-    stat = db_->AllTables(table_schema_array);
-    ASSERT_TRUE(stat.ok());
-    bool bfound = false;
-    for (auto &schema : table_schema_array) {
-        if (schema.table_id_ == TABLE_NAME) {
-            bfound = true;
-            break;
+    std::set<std::string> expect_file_paths;
+    std::experimental::filesystem::recursive_directory_iterator iter(root_path);
+    std::experimental::filesystem::recursive_directory_iterator end;
+    for (; iter != end; ++iter) {
+        if (std::experimental::filesystem::is_regular_file((*iter).path())) {
+            expect_file_paths.insert((*iter).path().filename().string());
         }
     }
-    ASSERT_TRUE(bfound);
 
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
-    ASSERT_EQ(table_info_get.dimension_, TABLE_DIM);
+    // TODO: Fix segment file suffix issue.
+    ASSERT_EQ(expect_file_paths.size(), segment_file_paths.size());
+}
 
-    uint64_t size;
-    db_->Size(size);
+TEST_F(DBTest, GetEntityTest) {
+    auto insert_entities = [&](const std::string& collection, const std::string& partition,
+                               uint64_t count, uint64_t batch_index, milvus::engine::IDNumbers& ids,
+                               milvus::engine::DataChunkPtr& data_chunk) -> Status {
+        BuildEntities(count, batch_index, data_chunk);
+        STATUS_CHECK(db_->Insert(collection, partition, data_chunk));
+        STATUS_CHECK(db_->Flush(collection));
+        auto iter = data_chunk->fixed_fields_.find(milvus::engine::FIELD_UID);
+        if (iter == data_chunk->fixed_fields_.end()) {
+            return Status(1, "Cannot find uid field");
+        }
+        auto& ids_buffer = iter->second;
+        ids.resize(data_chunk->count_);
+        memcpy(ids.data(), ids_buffer->data_.data(), ids_buffer->Size());
 
-    int64_t nb = 10;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
+        return Status::OK();
+    };
 
-    int loop = INSERT_LOOP;
-    for (auto i = 0; i < loop; ++i) {
-        milvus::engine::IDNumbers vector_ids;
-        db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
+    auto fill_field_names = [&](const milvus::engine::snapshot::FieldElementMappings& field_mappings,
+            std::vector<std::string>& field_names) -> void {
+        if (field_names.empty()) {
+            for (const auto& schema : field_mappings) {
+                field_names.emplace_back(schema.first->GetName());
+            }
+        } else {
+            for (const auto& name : field_names) {
+                bool find_field_name = false;
+                for (const auto& kv : field_mappings) {
+                    if (name == kv.first->GetName()) {
+                        find_field_name = true;
+                        break;
+                    }
+                }
+                if (not find_field_name) {
+                    return;
+                }
+            }
+        }
+    };
+
+    auto get_row_size = [&](const std::vector<bool>& valid_row) -> int {
+        int valid_row_size = 0;
+        for (auto valid : valid_row) {
+            if (valid)
+                valid_row_size++;
+        }
+        return valid_row_size;
+    };
+
+    std::string collection_name = "GET_ENTITY_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    milvus::engine::IDNumbers entity_ids;
+    milvus::engine::DataChunkPtr dataChunkPtr;
+    insert_entities(collection_name, "", 10000, 0, entity_ids, dataChunkPtr);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    milvus::engine::snapshot::CollectionPtr collection;
+    milvus::engine::snapshot::FieldElementMappings field_mappings;
+    status = db_->GetCollectionInfo(collection_name, collection, field_mappings);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+
+
+
+    {
+        std::vector<std::string> field_names;
+        fill_field_names(field_mappings, field_names);
+        milvus::engine::DataChunkPtr get_data_chunk;
+        std::vector<bool> valid_row;
+
+        status = db_->GetEntityByID(collection_name, entity_ids, field_names, valid_row, get_data_chunk);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_TRUE(get_data_chunk->count_ == get_row_size(valid_row));
+
+        for (const auto &name : field_names) {
+            ASSERT_TRUE(get_data_chunk->fixed_fields_[name]->Size() == dataChunkPtr->fixed_fields_[name]->Size());
+            ASSERT_TRUE(get_data_chunk->fixed_fields_[name]->data_ == dataChunkPtr->fixed_fields_[name]->data_);
+        }
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    db_->Size(size);
-    LOG(DEBUG) << "size=" << size;
-    ASSERT_LE(size, 1 * milvus::engine::G);
+    {
+        std::vector<std::string> field_names;
+        fill_field_names(field_mappings, field_names);
+        milvus::engine::DataChunkPtr get_data_chunk;
+        std::vector<bool> valid_row;
+        field_names.emplace_back("Hello World");
+        field_names.emplace_back("GoodBye World");
+
+        status = db_->GetEntityByID(collection_name, entity_ids, field_names, valid_row, get_data_chunk);
+        ASSERT_TRUE(!status.ok());
+    }
+
+    {
+        std::vector<std::string> field_names;
+        fill_field_names(field_mappings, field_names);
+        milvus::engine::DataChunkPtr get_data_chunk;
+        std::vector<bool> valid_row;
+        std::reverse(entity_ids.begin(), entity_ids.end());
+        entity_ids.push_back(-1);
+        entity_ids.push_back(-2);
+        std::reverse(entity_ids.begin(), entity_ids.end());
+
+        status = db_->GetEntityByID(collection_name, entity_ids, field_names, valid_row, get_data_chunk);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_TRUE(get_data_chunk->count_ == get_row_size(valid_row));
+
+        for (const auto &name : field_names) {
+            ASSERT_TRUE(get_data_chunk->fixed_fields_[name]->Size() == dataChunkPtr->fixed_fields_[name]->Size());
+            ASSERT_TRUE(get_data_chunk->fixed_fields_[name]->data_ == dataChunkPtr->fixed_fields_[name]->data_);
+        }
+    }
 }
 
-TEST_F(DBTest2, DELETE_TEST) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
+TEST_F(DBTest, CompactTest) {
+    std::string collection_name = "COMPACT_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok());
 
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
+    // insert 1000 entities into default partition
+    const uint64_t entity_count = 1000;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(entity_count, 0, data_chunk);
 
-    bool has_table = false;
-    db_->HasTable(TABLE_NAME, has_table);
-    ASSERT_TRUE(has_table);
+    status = db_->Insert(collection_name, "", data_chunk);
+    ASSERT_TRUE(status.ok());
 
-    uint64_t size;
-    db_->Size(size);
+    milvus::engine::IDNumbers batch_entity_ids;
+    milvus::engine::utils::GetIDFromChunk(data_chunk, batch_entity_ids);
+    ASSERT_EQ(batch_entity_ids.size(), entity_count);
 
-    int64_t nb = VECTOR_COUNT;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
+    auto delete_entity = [&](int64_t from, int64_t to) -> void {
+        int64_t delete_count = to - from;
+        if (delete_count < 0) {
+            return;
+        }
+        std::vector<milvus::engine::id_t> delete_ids;
+        for (auto i = from; i < to; ++i) {
+            delete_ids.push_back(batch_entity_ids[i]);
+        }
+        status = db_->DeleteEntityByID(collection_name, delete_ids);
+        ASSERT_TRUE(status.ok());
+    };
 
-    milvus::engine::IDNumbers vector_ids;
-    stat = db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
-    milvus::engine::TableIndex index;
-    stat = db_->CreateIndex(TABLE_NAME, index);
+    // delete entities from 100 to 300
+    int64_t delete_count_1 = 200;
+    delete_entity(100, 100 + delete_count_1);
 
-    std::vector<milvus::engine::meta::DateT> dates;
-    stat = db_->DeleteTable(TABLE_NAME, dates);
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    ASSERT_TRUE(stat.ok());
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
 
-    db_->HasTable(TABLE_NAME, has_table);
-    ASSERT_FALSE(has_table);
+    auto validate_entity_data = [&]() -> void {
+        std::vector<std::string> field_names = {"field_0"};
+        std::vector<bool> valid_row;
+        milvus::engine::DataChunkPtr fetch_chunk;
+        status = db_->GetEntityByID(collection_name, batch_entity_ids, field_names, valid_row, fetch_chunk);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(valid_row.size(), batch_entity_ids.size());
+        auto& chunk = fetch_chunk->fixed_fields_["field_0"];
+        int32_t* p = (int32_t*)(chunk->data_.data());
+        int64_t index = 0;
+        for (uint64_t i = 0; i < valid_row.size(); ++i) {
+            if (!valid_row[i]) {
+                continue;
+            }
+            ASSERT_EQ(p[index++], i);
+        }
+    };
+
+    // validate the left data is correct after deletion
+    validate_entity_data();
+
+    // delete entities from 700 to 800
+    int64_t delete_count_2 = 100;
+    delete_entity(700, 700 + delete_count_2);
+
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    auto validate_compact = [&](double threshold) -> void {
+        int64_t row_count = 0;
+        status = db_->CountEntities(collection_name, row_count);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(row_count, entity_count - delete_count_1 - delete_count_2);
+
+        status = db_->Compact(dummy_context_, collection_name, threshold);
+        ASSERT_TRUE(status.ok());
+
+        validate_entity_data();
+
+        status = db_->CountEntities(collection_name, row_count);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(row_count, entity_count - delete_count_1 - delete_count_2);
+
+        validate_entity_data();
+    };
+
+    // compact the collection, when threshold = 0.001, the compact do nothing
+    validate_compact(0.001); // compact skip
+    validate_compact(0.5); // do compact
 }
 
-TEST_F(DBTest2, DELETE_BY_RANGE_TEST) {
-    milvus::engine::meta::TableSchema table_info = BuildTableSchema();
-    auto stat = db_->CreateTable(table_info);
+TEST_F(DBTest, IndexTest) {
+    std::string collection_name = "INDEX_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok());
 
-    milvus::engine::meta::TableSchema table_info_get;
-    table_info_get.table_id_ = TABLE_NAME;
-    stat = db_->DescribeTable(table_info_get);
-    ASSERT_TRUE(stat.ok());
+    // insert 10000 entities into default partition
+    const uint64_t entity_count = 10000;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(entity_count, 0, data_chunk);
 
-    bool has_table = false;
-    db_->HasTable(TABLE_NAME, has_table);
-    ASSERT_TRUE(has_table);
+    status = db_->Insert(collection_name, "", data_chunk);
+    ASSERT_TRUE(status.ok());
 
-    uint64_t size;
-    db_->Size(size);
-    ASSERT_EQ(size, 0UL);
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
 
-    int64_t nb = VECTOR_COUNT;
-    std::vector<float> xb;
-    BuildVectors(nb, xb);
+    // create index for vector field, validate the index
+    {
+        milvus::engine::CollectionIndex index;
+        index.index_name_ = "my_index1";
+        index.index_type_ = milvus::knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+        index.metric_name_ = milvus::knowhere::Metric::L2;
+        index.extra_params_["nlist"] = 2048;
+        status = db_->CreateIndex(dummy_context_, collection_name, VECTOR_FIELD_NAME, index);
+        ASSERT_TRUE(status.ok());
 
-    milvus::engine::IDNumbers vector_ids;
-    stat = db_->InsertVectors(TABLE_NAME, nb, xb.data(), vector_ids);
-    milvus::engine::TableIndex index;
-    stat = db_->CreateIndex(TABLE_NAME, index);
+        milvus::engine::CollectionIndex index_get;
+        status = db_->DescribeIndex(collection_name, VECTOR_FIELD_NAME, index_get);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(index.index_name_, index_get.index_name_);
+        ASSERT_EQ(index.index_type_, index_get.index_type_);
+        ASSERT_EQ(index.metric_name_, index_get.metric_name_);
+        ASSERT_EQ(index.extra_params_, index_get.extra_params_);
+    }
 
-    db_->Size(size);
-    ASSERT_NE(size, 0UL);
+    // create index for structured fields, validate the index
+    {
+        milvus::engine::CollectionIndex index;
+        index.index_name_ = "my_index2";
+        index.index_type_ = milvus::engine::DEFAULT_STRUCTURED_INDEX;
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_0", index);
+        ASSERT_TRUE(status.ok());
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_1", index);
+        ASSERT_TRUE(status.ok());
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_2", index);
+        ASSERT_TRUE(status.ok());
 
-    std::vector<milvus::engine::meta::DateT> dates;
-    std::string start_value = CurrentTmDate();
-    std::string end_value = CurrentTmDate(1);
-    ConvertTimeRangeToDBDates(start_value, end_value, dates);
+        milvus::engine::CollectionIndex index_get;
+        status = db_->DescribeIndex(collection_name, "field_0", index_get);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(index.index_name_, index_get.index_name_);
+        ASSERT_EQ(index.index_type_, index_get.index_type_);
+    }
 
-    stat = db_->DeleteTable(TABLE_NAME, dates);
-    ASSERT_TRUE(stat.ok());
+    // drop index of vector field
+    {
+        status = db_->DropIndex(collection_name, VECTOR_FIELD_NAME);
+        ASSERT_TRUE(status.ok());
 
-    uint64_t row_count = 0;
-    db_->GetTableRowCount(TABLE_NAME, row_count);
-    ASSERT_EQ(row_count, 0UL);
+        milvus::engine::CollectionIndex index_get;
+        status = db_->DescribeIndex(collection_name, VECTOR_FIELD_NAME, index_get);
+        ASSERT_TRUE(status.ok());
+        ASSERT_TRUE(index_get.index_name_.empty());
+    }
+
+    // drop index of structured field 'field_0'
+    {
+        status = db_->DropIndex(collection_name, "field_0");
+        ASSERT_TRUE(status.ok());
+
+        milvus::engine::CollectionIndex index_get;
+        status = db_->DescribeIndex(collection_name, "field_0", index_get);
+        ASSERT_TRUE(status.ok());
+        ASSERT_TRUE(index_get.index_name_.empty());
+    }
+}
+
+TEST_F(DBTest, StatsTest) {
+    std::string collection_name = "STATS_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok());
+
+    std::string partition_name = "p1";
+    status = db_->CreatePartition(collection_name, partition_name);
+    ASSERT_TRUE(status.ok());
+
+    // insert 10000 entities into default partition
+    // insert 10000 entities into partition 'p1'
+    const uint64_t entity_count = 10000;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(entity_count, 0, data_chunk);
+
+    status = db_->Insert(collection_name, "", data_chunk);
+    ASSERT_TRUE(status.ok());
+
+    data_chunk->fixed_fields_.erase(milvus::engine::FIELD_UID); // clear auto-generated id
+
+    status = db_->Insert(collection_name, partition_name, data_chunk);
+    ASSERT_TRUE(status.ok());
+
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    // create index for vector field
+    {
+        milvus::engine::CollectionIndex index;
+        index.index_type_ = milvus::knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+        index.metric_name_ = milvus::knowhere::Metric::L2;
+        index.extra_params_["nlist"] = 2048;
+        status = db_->CreateIndex(dummy_context_, collection_name, VECTOR_FIELD_NAME, index);
+        ASSERT_TRUE(status.ok());
+    }
+
+    // create index for structured fields
+    {
+        milvus::engine::CollectionIndex index;
+        index.index_type_ = milvus::engine::DEFAULT_STRUCTURED_INDEX;
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_0", index);
+        ASSERT_TRUE(status.ok());
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_1", index);
+        ASSERT_TRUE(status.ok());
+        status = db_->CreateIndex(dummy_context_, collection_name, "field_2", index);
+        ASSERT_TRUE(status.ok());
+    }
+
+    // validate collection stats
+    milvus::json json_stats;
+    status = db_->GetCollectionStats(collection_name, json_stats);
+
+    std::string ss = json_stats.dump();
+    ASSERT_FALSE(ss.empty());
+
+    int64_t row_count = json_stats[milvus::engine::JSON_ROW_COUNT].get<int64_t>();
+    ASSERT_EQ(row_count, entity_count * 2);
+
+    int64_t data_size = json_stats[milvus::engine::JSON_DATA_SIZE].get<int64_t>();
+    ASSERT_GT(data_size, 0);
+
+    auto partitions = json_stats[milvus::engine::JSON_PARTITIONS];
+    ASSERT_EQ(partitions.size(), 2);
+
+    for (int32_t i = 0; i < 2; ++i) {
+        auto partition = partitions[i];
+        row_count = partition[milvus::engine::JSON_ROW_COUNT].get<int64_t>();
+        ASSERT_EQ(row_count, entity_count);
+        auto segments = partition[milvus::engine::JSON_SEGMENTS];
+        ASSERT_EQ(segments.size(), 1);
+
+        auto segment = segments[0];
+        row_count = segment[milvus::engine::JSON_ROW_COUNT].get<int64_t>();
+        ASSERT_EQ(row_count, entity_count);
+
+        data_size = segment[milvus::engine::JSON_DATA_SIZE].get<int64_t>();
+        ASSERT_GT(data_size, 0);
+
+        auto files = segment[milvus::engine::JSON_FILES];
+        ASSERT_GT(files.size(), 0);
+
+        for (uint64_t k = 0; k < files.size(); ++k) {
+            auto file = files[k];
+            std::string field_name = file[milvus::engine::JSON_FIELD].get<std::string>();
+            ASSERT_FALSE(field_name.empty());
+            std::string path = file[milvus::engine::JSON_PATH].get<std::string>();
+            ASSERT_FALSE(path.empty());
+            data_size = file[milvus::engine::JSON_DATA_SIZE].get<int64_t>();
+            ASSERT_GE(data_size, 0);
+        }
+    }
+}
+
+TEST_F(DBTest, FetchTest) {
+    std::string collection_name = "STATS_TEST";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok());
+
+    std::string partition_name = "p1";
+    status = db_->CreatePartition(collection_name, partition_name);
+    ASSERT_TRUE(status.ok());
+
+    // insert 1000 entities into default partition
+    // insert 1000 entities into partition 'p1'
+    const uint64_t entity_count = 1000;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(entity_count, 0, data_chunk);
+
+    status = db_->Insert(collection_name, "", data_chunk);
+    ASSERT_TRUE(status.ok());
+
+    data_chunk->fixed_fields_.erase(milvus::engine::FIELD_UID); // clear auto-generated id
+
+    status = db_->Insert(collection_name, partition_name, data_chunk);
+    ASSERT_TRUE(status.ok());
+
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    // get all the entities id of partition 'p1'
+    milvus::engine::IDNumbers batch_entity_ids;
+    milvus::engine::utils::GetIDFromChunk(data_chunk, batch_entity_ids);
+    ASSERT_EQ(batch_entity_ids.size(), entity_count);
+
+    // delete first 10 entities from partition 'p1'
+    int64_t delete_count = 10;
+    milvus::engine::IDNumbers delete_entity_ids = batch_entity_ids;
+    delete_entity_ids.resize(delete_count);
+    status = db_->DeleteEntityByID(collection_name, delete_entity_ids);
+    ASSERT_TRUE(status.ok());
+
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    // try fetch first 10 entities of parititon 'p1', since they were deleted, nothing returned
+    std::vector<std::string> field_names = {milvus::engine::FIELD_UID, VECTOR_FIELD_NAME, "field_0"};
+    std::vector<bool> valid_row;
+    milvus::engine::DataChunkPtr fetch_chunk;
+    status = db_->GetEntityByID(collection_name, delete_entity_ids, field_names, valid_row, fetch_chunk);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(fetch_chunk->count_, 0);
+    for (auto valid : valid_row) {
+        ASSERT_FALSE(valid);
+    }
+
+    // fetch all entities from the partition 'p1', 990 entities returned
+    fetch_chunk = nullptr;
+    status = db_->GetEntityByID(collection_name, batch_entity_ids, field_names, valid_row, fetch_chunk);
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(fetch_chunk->count_, batch_entity_ids.size() - delete_entity_ids.size());
+    auto& uid = fetch_chunk->fixed_fields_[milvus::engine::FIELD_UID];
+    ASSERT_EQ(uid->Size() / sizeof(int64_t), fetch_chunk->count_);
+    auto& vectors = fetch_chunk->fixed_fields_[VECTOR_FIELD_NAME];
+    ASSERT_EQ(vectors->Size() / (COLLECTION_DIM * sizeof(float)), fetch_chunk->count_);
+
+    // get collection stats
+    // the segment of default partition has 1000 entities
+    // the segment of partition 'p1' only has 990 entities
+    milvus::json json_stats;
+    status = db_->GetCollectionStats(collection_name, json_stats);
+    ASSERT_TRUE(status.ok());
+
+    auto partitions = json_stats[milvus::engine::JSON_PARTITIONS];
+    ASSERT_EQ(partitions.size(), 2);
+
+    for (int32_t i = 0; i < 2; ++i) {
+        auto partition = partitions[i];
+        std::string tag = partition[milvus::engine::JSON_PARTITION_TAG].get<std::string>();
+
+        auto segments = partition[milvus::engine::JSON_SEGMENTS];
+        ASSERT_EQ(segments.size(), 1);
+
+        auto segment = segments[0];
+        int64_t id = segment[milvus::engine::JSON_ID].get<int64_t>();
+
+        milvus::engine::IDNumbers segment_entity_ids;
+        status = db_->ListIDInSegment(collection_name, id, segment_entity_ids);
+        std::cout << status.message() << std::endl;
+        ASSERT_TRUE(status.ok());
+
+        if (tag == partition_name) {
+            ASSERT_EQ(segment_entity_ids.size(), batch_entity_ids.size() - delete_entity_ids.size());
+        } else {
+            ASSERT_EQ(segment_entity_ids.size(), batch_entity_ids.size());
+        }
+    }
+}
+
+TEST_F(DBTest, DeleteEntitiesTest) {
+    std::string collection_name = "test_collection_delete_";
+    CreateCollection2(db_, collection_name, 0);
+
+    // insert 100 entities into default partition without flush
+    milvus::engine::IDNumbers entity_ids;
+    milvus::engine::DataChunkPtr data_chunk;
+    BuildEntities(100, 0, data_chunk);
+    auto status = db_->Insert(collection_name, "", data_chunk);
+    milvus::engine::utils::GetIDFromChunk(data_chunk, entity_ids);
+
+    // delete all the entities in memory
+    status = db_->DeleteEntityByID(collection_name, entity_ids);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    // flush empty segment
+    db_->Flush(collection_name);
+
+    auto insert_entities = [&](const std::string& collection, const std::string& partition,
+                               uint64_t count, uint64_t batch_index, milvus::engine::IDNumbers& ids) -> Status {
+        milvus::engine::DataChunkPtr data_chunk;
+        BuildEntities(count, batch_index, data_chunk);
+        STATUS_CHECK(db_->Insert(collection, partition, data_chunk));
+        STATUS_CHECK(db_->Flush(collection));
+
+        ids.clear();
+        milvus::engine::utils::GetIDFromChunk(data_chunk, ids);
+        return Status::OK();
+    };
+
+    // insert 1000 entities into default partition
+    status = insert_entities(collection_name, "", 1000, 0, entity_ids);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    // delete the first entity
+    milvus::engine::IDNumbers delete_ids = {entity_ids[0]};
+    status = db_->DeleteEntityByID(collection_name, delete_ids);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    milvus::engine::IDNumbers whole_delete_ids;
+    fiu_init(0);
+    fiu_enable_random("MemCollection.ApplyDeletes.RandomSleep", 1, nullptr, 0, 0.5);
+    for (size_t i = 0; i < 5; i++) {
+        std::string partition0 = collection_name + "p_" + std::to_string(i) + "_0";
+        std::string partition1 = collection_name + "p_" + std::to_string(i) + "_1";
+
+        status = db_->CreatePartition(collection_name, partition0);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+
+        status = db_->CreatePartition(collection_name, partition1);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+
+        // insert 1000 entities into partition_0
+        milvus::engine::IDNumbers partition0_ids;
+        status = insert_entities(collection_name, partition0, 1000, 2 * i + 1, partition0_ids);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+
+        // insert 1000 entities into partition_1
+        milvus::engine::IDNumbers partition1_ids;
+        status = insert_entities(collection_name, partition1, 1000, 2 * i + 2, partition1_ids);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+
+        // delete the first entity of each partition
+        milvus::engine::IDNumbers partition_delete_ids = {partition0_ids[0], partition1_ids[0]};
+        whole_delete_ids.insert(whole_delete_ids.begin(), partition_delete_ids.begin(), partition_delete_ids.end());
+        db_->DeleteEntityByID(collection_name, partition_delete_ids);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+
+        // drop partition_1
+        status = db_->DropPartition(collection_name, partition1);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+    }
+
+    // flush will apply the deletion
+    status = db_->Flush();
+    ASSERT_TRUE(status.ok());
+
+    fiu_disable("MemCollection.ApplyDeletes.RandomSleep");
+
+    // get first entity from partition_0, the entity has been deleted, no entity returned
+    // get first entity from partition_1, the partition has been deleted, no entity returned
+    std::vector<bool> valid_row;
+    milvus::engine::DataChunkPtr entity_data_chunk;
+    for (auto& id : whole_delete_ids) {
+        status = db_->GetEntityByID(collection_name, {id}, {}, valid_row, entity_data_chunk);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_EQ(entity_data_chunk->count_, 0);
+    }
+}
+
+TEST_F(DBTest, DeleteStaleTest) {
+    const int del_id_pair = 3;
+    auto insert_entities = [&](const std::string& collection, const std::string& partition,
+                               uint64_t count, uint64_t batch_index, milvus::engine::IDNumbers& ids) -> Status {
+        milvus::engine::DataChunkPtr data_chunk;
+        BuildEntities(count, batch_index, data_chunk);
+        STATUS_CHECK(db_->Insert(collection, partition, data_chunk));
+        STATUS_CHECK(db_->Flush(collection));
+        auto iter = data_chunk->fixed_fields_.find(milvus::engine::FIELD_UID);
+        if (iter == data_chunk->fixed_fields_.end()) {
+            return Status(1, "Cannot find uid field");
+        }
+        auto& ids_buffer = iter->second;
+        ids.resize(data_chunk->count_);
+        memcpy(ids.data(), ids_buffer->data_.data(), ids_buffer->Size());
+
+        return Status::OK();
+    };
+
+    auto build_task = [&](const std::string& collection, const std::string& field) {
+        milvus::engine::CollectionIndex index;
+        index.index_name_ = "my_index1";
+        index.index_type_ = milvus::knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+        index.metric_name_ = milvus::knowhere::Metric::L2;
+        index.extra_params_["nlist"] = 2048;
+        auto status = db_->CreateIndex(dummy_context_, collection, field, index);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+    };
+
+    auto delete_task = [&](const std::string& collection, const milvus::engine::IDNumbers& del_ids) {
+        auto status = Status::OK();
+        for (size_t i = 0; i < del_id_pair; i++) {
+            milvus::engine::IDNumbers ids = {del_ids[2 * i], del_ids[2 * i + 1]};
+            status = db_->DeleteEntityByID(collection, ids);
+            ASSERT_TRUE(status.ok()) << status.ToString();
+            sleep(1);
+        }
+    };
+
+    const std::string collection_name = "test_delete_stale_";
+    auto status = CreateCollection2(db_, collection_name, 0);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    milvus::engine::IDNumbers del_ids;
+    milvus::engine::IDNumbers entity_ids;
+    status = insert_entities(collection_name, "", 10000, 0, entity_ids);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    status = db_->Flush(collection_name);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    milvus::engine::IDNumbers entity_ids2;
+    status = insert_entities(collection_name, "", 10000, 1, entity_ids2);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    status = db_->Flush(collection_name);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    for (size_t i = 0; i < del_id_pair; i ++) {
+        del_ids.push_back(entity_ids[i]);
+        del_ids.push_back(entity_ids2[i]);
+    }
+
+    fiu_init(0);
+    fiu_enable_random("MemCollection.ApplyDeletes.RandomSleep", 1, nullptr, 0, 0.5);
+    auto build_thread = std::thread(build_task, collection_name, VECTOR_FIELD_NAME);
+    auto delete_thread = std::thread(delete_task, collection_name, del_ids);
+    delete_thread.join();
+    build_thread.join();
+    fiu_disable("MemCollection.ApplyDeletes.RandomSleep");
+    db_->Flush();
+//    int64_t row_count;
+//    status = db_->CountEntities(collection_name, row_count);
+//    ASSERT_TRUE(status.ok()) << status.ToString();
+//    ASSERT_EQ(row_count, 10000 * 2 - 2 * del_id_pair);
+//
+//    std::vector<bool> valid_row;
+//    milvus::engine::DataChunkPtr entity_data_chunk;
+//    for (size_t j = 0; j < del_ids.size(); j++) {
+//        status = db_->GetEntityByID(collection_name, {del_ids[j]}, {}, valid_row, entity_data_chunk);
+//        ASSERT_TRUE(status.ok()) << status.ToString();
+//        ASSERT_EQ(entity_data_chunk->count_, 0) << "[" << j << "] Delete id " << del_ids[j] << " failed.";
+//    }
 }

@@ -1,69 +1,29 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "utils/CommonUtil.h"
 #include "utils/Log.h"
 
 #include <dirent.h>
+#include <fiu-local.h>
 #include <pwd.h>
-#include <string.h>
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
-#include <time.h>
 #include <unistd.h>
+#include <boost/filesystem.hpp>
 #include <iostream>
-#include <thread>
-
-#include "boost/filesystem.hpp"
-
-#if defined(__x86_64__)
-#define THREAD_MULTIPLY_CPU 1
-#elif defined(__powerpc64__)
-#define THREAD_MULTIPLY_CPU 4
-#else
-#define THREAD_MULTIPLY_CPU 1
-#endif
+#include <vector>
 
 namespace milvus {
-namespace server {
 
 namespace fs = boost::filesystem;
-
-bool
-CommonUtil::GetSystemMemInfo(uint64_t& total_mem, uint64_t& free_mem) {
-    struct sysinfo info;
-    int ret = sysinfo(&info);
-    total_mem = info.totalram;
-    free_mem = info.freeram;
-
-    return ret == 0;  // succeed 0, failed -1
-}
-
-bool
-CommonUtil::GetSystemAvailableThreads(uint32_t& thread_count) {
-    // threadCnt = std::thread::hardware_concurrency();
-    thread_count = sysconf(_SC_NPROCESSORS_CONF);
-    thread_count *= THREAD_MULTIPLY_CPU;
-    if (thread_count == 0) {
-        thread_count = 8;
-    }
-
-    return true;
-}
 
 bool
 CommonUtil::IsDirectoryExist(const std::string& path) {
@@ -91,6 +51,7 @@ CommonUtil::CreateDirectory(const std::string& path) {
     fs::path fs_path(path);
     fs::path parent_path = fs_path.parent_path();
     Status err_status = CreateDirectory(parent_path.string());
+    fiu_do_on("CommonUtil.CreateDirectory.create_parent_fail", err_status = Status(SERVER_INVALID_ARGUMENT, ""));
     if (!err_status.ok()) {
         return err_status;
     }
@@ -101,6 +62,7 @@ CommonUtil::CreateDirectory(const std::string& path) {
     }
 
     int makeOK = mkdir(path.c_str(), S_IRWXU | S_IRGRP | S_IROTH);
+    fiu_do_on("CommonUtil.CreateDirectory.create_dir_fail", makeOK = 1);
     if (makeOK != 0) {
         return Status(SERVER_UNEXPECTED_ERROR, "failed to create directory: " + path);
     }
@@ -176,9 +138,10 @@ CommonUtil::GetFileName(std::string filename) {
 
 std::string
 CommonUtil::GetExePath() {
-    const size_t buf_len = 1024;
+    const int64_t buf_len = 1024;
     char buf[buf_len];
-    size_t cnt = readlink("/proc/self/exe", buf, buf_len);
+    int64_t cnt = readlink("/proc/self/exe", buf, buf_len);
+    fiu_do_on("CommonUtil.GetExePath.readlink_fail", cnt = -1);
     if (cnt < 0 || cnt >= buf_len) {
         return "";
     }
@@ -186,7 +149,8 @@ CommonUtil::GetExePath() {
     buf[cnt] = '\0';
 
     std::string exe_path = buf;
-    if (exe_path.rfind('/') != exe_path.length()) {
+    fiu_do_on("CommonUtil.GetExePath.exe_path_error", exe_path = "/");
+    if (exe_path.rfind('/') != exe_path.length() - 1) {
         std::string sub_str = exe_path.substr(0, exe_path.rfind('/'));
         return sub_str + "/";
     }
@@ -222,5 +186,20 @@ CommonUtil::ConvertTime(tm time_struct, time_t& time_integer) {
     time_integer = mktime(&time_struct);
 }
 
-}  // namespace server
+#ifdef ENABLE_CPU_PROFILING
+std::string
+CommonUtil::GetCurrentTimeStr() {
+    time_t tt;
+    time(&tt);
+    tt = tt + 8 * 60;
+    tm t;
+    gmtime_r(&tt, &t);
+
+    std::string str = std::to_string(t.tm_year + 1900) + "_" + std::to_string(t.tm_mon + 1) + "_" +
+                      std::to_string(t.tm_mday) + "_" + std::to_string(t.tm_hour) + "_" + std::to_string(t.tm_min) +
+                      "_" + std::to_string(t.tm_sec);
+    return str;
+}
+#endif
+
 }  // namespace milvus

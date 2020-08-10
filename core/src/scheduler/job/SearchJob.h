@@ -1,19 +1,13 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 #pragma once
 
 #include <condition_variable>
@@ -29,91 +23,67 @@
 #include <vector>
 
 #include "Job.h"
+#include "db/SnapshotVisitor.h"
 #include "db/Types.h"
-#include "db/meta/MetaTypes.h"
+
+#include "server/context/Context.h"
 
 namespace milvus {
 namespace scheduler {
 
-using engine::meta::TableFileSchemaPtr;
-
-using Id2IndexMap = std::unordered_map<size_t, TableFileSchemaPtr>;
-
-using ResultIds = engine::ResultIds;
-using ResultDistances = engine::ResultDistances;
+// struct SearchTimeStat {
+//    double query_time = 0.0;
+//    double map_uids_time = 0.0;
+//    double reduce_time = 0.0;
+//};
 
 class SearchJob : public Job {
  public:
-    SearchJob(uint64_t topk, uint64_t nq, uint64_t nprobe, const float* vectors);
+    SearchJob(const server::ContextPtr& context, const engine::snapshot::ScopedSnapshotT& snapshot,
+              engine::DBOptions options, const query::QueryPtr& query_ptr,
+              const engine::snapshot::IDS_TYPE& segment_ids);
 
  public:
-    bool
-    AddIndexFile(const TableFileSchemaPtr& index_file);
-
-    void
-    WaitResult();
-
-    void
-    SearchDone(size_t index_id);
-
-    ResultIds&
-    GetResultIds();
-
-    ResultDistances&
-    GetResultDistances();
-
-    Status&
-    GetStatus();
-
     json
     Dump() const override;
 
- public:
-    uint64_t
-    topk() const {
-        return topk_;
+    const server::ContextPtr&
+    GetContext() const {
+        return context_;
     }
 
-    uint64_t
-    nq() const {
-        return nq_;
+    engine::DBOptions
+    options() const {
+        return options_;
     }
 
-    uint64_t
-    nprobe() const {
-        return nprobe_;
+    const query::QueryPtr
+    query_ptr() const {
+        return query_ptr_;
     }
 
-    const float*
-    vectors() const {
-        return vectors_;
+    engine::QueryResultPtr&
+    query_result() {
+        return query_result_;
     }
 
-    Id2IndexMap&
-    index_files() {
-        return index_files_;
+    const engine::snapshot::IDS_TYPE&
+    segment_ids() {
+        return segment_ids_;
     }
 
-    std::mutex&
-    mutex() {
-        return mutex_;
-    }
+ protected:
+    void
+    OnCreateTasks(JobTasks& tasks) override;
 
  private:
-    uint64_t topk_ = 0;
-    uint64_t nq_ = 0;
-    uint64_t nprobe_ = 0;
-    // TODO: smart pointer
-    const float* vectors_ = nullptr;
+    const server::ContextPtr context_;
+    engine::snapshot::ScopedSnapshotT snapshot_;
+    engine::DBOptions options_;
 
-    Id2IndexMap index_files_;
-    // TODO: column-base better ?
-    ResultIds result_ids_;
-    ResultDistances result_distances_;
-    Status status_;
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
+    query::QueryPtr query_ptr_;
+    engine::QueryResultPtr query_result_;
+    engine::snapshot::IDS_TYPE segment_ids_;
 };
 
 using SearchJobPtr = std::shared_ptr<SearchJob>;

@@ -1,26 +1,15 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
-
-#include "MemManager.h"
-#include "MemTable.h"
-#include "db/meta/Meta.h"
-#include "utils/Status.h"
 
 #include <ctime>
 #include <map>
@@ -28,7 +17,12 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include "db/insert/MemCollection.h"
+#include "db/insert/MemManager.h"
+#include "utils/Status.h"
 
 namespace milvus {
 namespace engine {
@@ -36,18 +30,31 @@ namespace engine {
 class MemManagerImpl : public MemManager {
  public:
     using Ptr = std::shared_ptr<MemManagerImpl>;
+    using MemCollectionMap = std::unordered_map<int64_t, MemCollectionPtr>;
+    using MemList = std::vector<MemCollectionPtr>;
 
-    MemManagerImpl(const meta::MetaPtr& meta, const DBOptions& options) : meta_(meta), options_(options) {
+    explicit MemManagerImpl(const DBOptions& options) : options_(options) {
     }
 
-    Status
-    InsertVectors(const std::string& table_id, size_t n, const float* vectors, IDNumbers& vector_ids) override;
+    ~MemManagerImpl() = default;
 
     Status
-    Serialize(std::set<std::string>& table_ids) override;
+    InsertEntities(int64_t collection_id, int64_t partition_id, const DataChunkPtr& chunk, uint64_t lsn) override;
 
     Status
-    EraseMemVector(const std::string& table_id) override;
+    DeleteEntities(int64_t collection_id, const std::vector<id_t>& entity_ids, uint64_t lsn) override;
+
+    Status
+    Flush(int64_t collection_id) override;
+
+    Status
+    Flush(std::set<int64_t>& collection_ids) override;
+
+    Status
+    EraseMem(int64_t collection_id) override;
+
+    Status
+    EraseMem(int64_t collection_id, int64_t partition_id) override;
 
     size_t
     GetCurrentMutableMem() override;
@@ -59,19 +66,31 @@ class MemManagerImpl : public MemManager {
     GetCurrentMem() override;
 
  private:
-    MemTablePtr
-    GetMemByTable(const std::string& table_id);
+    MemCollectionPtr
+    GetMemByCollection(int64_t collection_id);
 
     Status
-    InsertVectorsNoLock(const std::string& table_id, size_t n, const float* vectors, IDNumbers& vector_ids);
+    ValidateChunk(int64_t collection_id, const DataChunkPtr& chunk);
+
+    Status
+    InsertEntitiesNoLock(int64_t collection_id, int64_t partition_id, const VectorSourcePtr& source, uint64_t lsn);
+
     Status
     ToImmutable();
 
-    using MemIdMap = std::map<std::string, MemTablePtr>;
-    using MemList = std::vector<MemTablePtr>;
-    MemIdMap mem_id_map_;
+    Status
+    ToImmutable(int64_t collection_id);
+
+    uint64_t
+    GetMaxLSN(const MemList& collections);
+
+    Status
+    InternalFlush(std::set<int64_t>& collection_ids);
+
+ private:
+    MemCollectionMap mem_map_;
     MemList immu_mem_list_;
-    meta::MetaPtr meta_;
+
     DBOptions options_;
     std::mutex mutex_;
     std::mutex serialization_mtx_;

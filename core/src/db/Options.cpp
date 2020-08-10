@@ -1,21 +1,17 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "db/Options.h"
+#include <fiu-local.h>
+#include <limits>
 #include "utils/Exception.h"
 #include "utils/Log.h"
 
@@ -25,6 +21,10 @@
 
 namespace milvus {
 namespace engine {
+
+const char* ARCHIVE_CONF_DISK = "disk";
+const char* ARCHIVE_CONF_DAYS = "days";
+const char* DEFAULT_PARTITON_TAG = "_default";
 
 ArchiveConf::ArchiveConf(const std::string& type, const std::string& criterias) {
     ParseType(type);
@@ -45,7 +45,8 @@ ArchiveConf::ParseCritirias(const std::string& criterias) {
 
     boost::algorithm::split(tokens, criterias, boost::is_any_of(";"));
 
-    if (tokens.size() == 0) {
+    fiu_do_on("ArchiveConf.ParseCritirias.empty_tokens", tokens.clear());
+    if (tokens.empty()) {
         return;
     }
 
@@ -57,23 +58,25 @@ ArchiveConf::ParseCritirias(const std::string& criterias) {
         std::vector<std::string> kv;
         boost::algorithm::split(kv, token, boost::is_any_of(":"));
         if (kv.size() != 2) {
-            ENGINE_LOG_WARNING << "Invalid ArchiveConf Criterias: " << token << " Ignore!";
+            LOG_ENGINE_WARNING_ << "Invalid ArchiveConf Criterias: " << token << " Ignore!";
             continue;
         }
         if (kv[0] != "disk" && kv[0] != "days") {
-            ENGINE_LOG_WARNING << "Invalid ArchiveConf Criterias: " << token << " Ignore!";
+            LOG_ENGINE_WARNING_ << "Invalid ArchiveConf Criterias: " << token << " Ignore!";
             continue;
         }
         try {
+            fiu_do_on("ArchiveConf.ParseCritirias.OptionsParseCritiriasOutOfRange",
+                      kv[1] = std::to_string(std::numeric_limits<int>::max() + 1UL));
             auto value = std::stoi(kv[1]);
             criterias_[kv[0]] = value;
         } catch (std::out_of_range&) {
             std::string msg = "Out of range: '" + kv[1] + "'";
-            ENGINE_LOG_ERROR << msg;
+            LOG_ENGINE_ERROR_ << msg;
             throw InvalidArgumentException(msg);
         } catch (...) {
             std::string msg = "Invalid argument: '" + kv[1] + "'";
-            ENGINE_LOG_ERROR << msg;
+            LOG_ENGINE_ERROR_ << msg;
             throw InvalidArgumentException(msg);
         }
     }

@@ -1,45 +1,188 @@
-# Default values are used when you make no changes to the following parameters.
+# Copyright (C) 2019-2020 Zilliz. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under the License.
 
-server_config:
-  address: 0.0.0.0                  # milvus server ip address (IPv4)
-  port: 19530                       # milvus server port, must in range [1025, 65534]
-  deploy_mode: single               # deployment type: single, cluster_readonly, cluster_writable
-  time_zone: UTC+8                  # time zone, must be in format: UTC+X
+version: 0.5
 
-db_config:
-  primary_path: @MILVUS_DB_PATH@    # path used to store data and meta
-  secondary_path:                   # path used to store data only, split by semicolon
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Cluster Config       | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# enable               | If running with Mishards, set true, otherwise false.       | Boolean    | false           |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# role                 | Milvus deployment role: rw / ro                            | Role       | rw              |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+cluster:
+  enable: false
+  role: rw
 
-  backend_url: sqlite://:@:/        # URI format: dialect://username:password@host:port/database
-                                    # Keep 'dialect://:@:/', and replace other texts with real values
-                                    # Replace 'dialect' with 'mysql' or 'sqlite'
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# General Config       | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# timezone             | Use UTC-x or UTC+x to specify a time zone.                 | Timezone   | UTC+8           |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# meta_uri             | URI for metadata storage, using SQLite (for single server  | URI        | sqlite://:@:/   |
+#                      | Milvus) or MySQL (for distributed cluster Milvus).         |            |                 |
+#                      | Format: dialect://username:password@host:port/database     |            |                 |
+#                      | Keep 'dialect://:@:/', 'dialect' can be either 'sqlite' or |            |                 |
+#                      | 'mysql', replace other texts with real values.             |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+general:
+  timezone: UTC+8
+  meta_uri: sqlite://:@:/
 
-  insert_buffer_size: 4             # GB, maximum insert buffer size allowed, must be a positive integer
-                                    # sum of insert_buffer_size and cpu_cache_capacity cannot exceed total memory
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Network Config       | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# bind.address         | IP address that Milvus server monitors.                    | IP         | 0.0.0.0         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# bind.port            | Port that Milvus server monitors. Port range (1024, 65535) | Integer    | 19530           |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# http.enable          | Enable HTTP server or not.                                 | Boolean    | true            |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# http.port            | Port that Milvus HTTP server monitors.                     | Integer    | 19121           |
+#                      | Port range (1024, 65535)                                   |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+network: 
+  bind.address: 0.0.0.0
+  bind.port: 19530
+  http.enable: true
+  http.port: 19121
 
-  preload_table:                    # preload data at startup, '*' means load all tables, empty value means no preload
-                                    # you can specify preload tables like this: table1,table2,table3
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Storage Config       | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# path                 | Path used to save meta data, vector data and index data.   | Path       | /var/lib/milvus |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# auto_flush_interval  | The interval, in seconds, at which Milvus automatically    | Integer    | 1 (s)           |
+#                      | flushes data to disk.                                      |            |                 |
+#                      | 0 means disable the regular flush.                         |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+storage:
+  path: @MILVUS_DB_PATH@
+  auto_flush_interval: 1
 
-metric_config:
-  enable_monitor: false             # enable monitoring or not, must be a boolean
-  collector: prometheus             # prometheus
-  prometheus_config:
-    port: 8080                      # port prometheus uses to fetch metrics, must in range [1025, 65534]
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# WAL Config           | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# enable               | Whether to enable write-ahead logging (WAL) in Milvus.     | Boolean    | true            |
+#                      | If WAL is enabled, Milvus writes all data changes to log   |            |                 |
+#                      | files in advance before implementing data changes. WAL     |            |                 |
+#                      | ensures the atomicity and durability for Milvus operations.|            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# recovery_error_ignore| Whether to ignore logs with errors that happens during WAL | Boolean    | false           |
+#                      | recovery. If true, when Milvus restarts for recovery and   |            |                 |
+#                      | there are errors in WAL log files, log files with errors   |            |                 |
+#                      | are ignored. If false, Milvus does not restart when there  |            |                 |
+#                      | are errors in WAL log files.                               |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# buffer_size          | Sum total of the read buffer and the write buffer in Bytes.| String     | 256MB           |
+#                      | buffer_size must be in range [64MB, 4096MB].               |            |                 |
+#                      | If the value you specified is out of range, Milvus         |            |                 |
+#                      | automatically uses the boundary value closest to the       |            |                 |
+#                      | specified value. It is recommended you set buffer_size to  |            |                 |
+#                      | a value greater than the inserted data size of a single    |            |                 |
+#                      | insert operation for better performance.                   |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# path                 | Location of WAL log files.                                 | String     |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+wal:
+  enable: true
+  recovery_error_ignore: false
+  buffer_size: 256MB
+  path: @MILVUS_DB_PATH@/wal
 
-cache_config:
-  cpu_cache_capacity: 16            # GB, CPU memory used for cache, must be a positive integer
-  cpu_cache_threshold: 0.85         # percentage of data that will be kept when cache cleanup is triggered, must be in range (0.0, 1.0]
-  gpu_cache_capacity: 4             # GB, GPU memory used for cache, must be a positive integer
-  gpu_cache_threshold: 0.85         # percentage of data that will be kept when cache cleanup is triggered, must be in range (0.0, 1.0]
-  cache_insert_data: false          # whether to load inserted data into cache, must be a boolean
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Cache Config         | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# cache_size           | The size of CPU memory used for caching data for faster    | String     | 4GB             |
+#                      | query. The sum of 'cache_size' and 'insert_buffer_size'    |            |                 |
+#                      | must be less than system memory size.                      |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# insert_buffer_size   | Buffer size used for data insertion.                       | String     | 1GB             |
+#                      | The sum of 'insert_buffer_size' and 'cache_size'           |            |                 |
+#                      | must be less than system memory size.                      |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# preload_collection   | A comma-separated list of collection names that need to    | StringList |                 |
+#                      | be pre-loaded when Milvus server starts up.                |            |                 |
+#                      | '*' means preload all existing tables (single-quote or     |            |                 |
+#                      | double-quote required).                                    |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+cache:
+  cache_size: 4GB
+  insert_buffer_size: 1GB
+  preload_collection:
 
-engine_config:
-  use_blas_threshold: 1100          # if nq <  use_blas_threshold, use SSE, faster with fluctuated response times
-                                    # if nq >= use_blas_threshold, use OpenBlas, slower with stable response times
-  gpu_search_threshold: 1000        # threshold beyond which the search computation is executed on GPUs only
-
-resource_config:
-  search_resources:                 # define the devices used for search computation, must be in format: cpu or gpux
-    - cpu
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# GPU Config           | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# enable               | Use GPU devices or not.                                    | Boolean    | false           |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# cache_size           | The size of GPU memory per card used for cache.            | String     | 1GB             |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# gpu_search_threshold | A Milvus performance tuning parameter. This value will be  | Integer    | 1000            |
+#                      | compared with 'nq' to decide if the search computation will|            |                 |
+#                      | be executed on GPUs only.                                  |            |                 |
+#                      | If nq >= gpu_search_threshold, the search computation will |            |                 |
+#                      | be executed on GPUs only;                                  |            |                 |
+#                      | if nq < gpu_search_threshold, the search computation will  |            |                 |
+#                      | be executed on both CPUs and GPUs.                         |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# search_devices       | The list of GPU devices used for search computation.       | DeviceList | gpu0            |
+#                      | Must be in format gpux.                                    |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# build_index_devices  | The list of GPU devices used for index building.           | DeviceList | gpu0            |
+#                      | Must be in format gpux.                                    |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+gpu:
+  enable: @GPU_ENABLE@
+  cache_size: 1GB
+  gpu_search_threshold: 1000
+  search_devices:
     - gpu0
-  index_build_device: gpu0          # GPU used for building index, must be in format: gpux
+  build_index_devices:
+    - gpu0
+
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Logs Config          | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# level                | Log level in Milvus. Must be one of debug, info, warning,  | String     | debug           |
+#                      | error, fatal                                               |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# trace.enable         | Whether to enable trace level logging in Milvus.           | Boolean    | true            |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# path                 | Absolute path to the folder holding the log files.         | String     |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# max_log_file_size    | The maximum size of each log file, size range              | String     | 1024MB          |
+#                      | [512MB, 4096MB].                                           |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# log_rotate_num       | The maximum number of log files that Milvus keeps for each | Integer    | 0               |
+#                      | logging level, num range [0, 1024], 0 means unlimited.     |            |                 |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+logs:
+  level: debug
+  trace.enable: true
+  path: @MILVUS_DB_PATH@/logs
+  max_log_file_size: 1024MB
+  log_rotate_num: 0
+
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# Metric Config        | Description                                                | Type       | Default         |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# enable               | Enable monitoring function or not.                         | Boolean    | false           |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# address              | Pushgateway address                                        | IP         | 127.0.0.1       +
+#----------------------+------------------------------------------------------------+------------+-----------------+
+# port                 | Pushgateway port, port range (1024, 65535)                 | Integer    | 9091            |
+#----------------------+------------------------------------------------------------+------------+-----------------+
+metric:
+  enable: false
+  address: 127.0.0.1
+  port: 9091
+

@@ -1,82 +1,45 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "scheduler/job/SearchJob.h"
+#include "scheduler/task/SearchTask.h"
 #include "utils/Log.h"
 
 namespace milvus {
 namespace scheduler {
 
-SearchJob::SearchJob(uint64_t topk, uint64_t nq, uint64_t nprobe, const float* vectors)
-    : Job(JobType::SEARCH), topk_(topk), nq_(nq), nprobe_(nprobe), vectors_(vectors) {
-}
-
-bool
-SearchJob::AddIndexFile(const TableFileSchemaPtr& index_file) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (index_file == nullptr || index_files_.find(index_file->id_) != index_files_.end()) {
-        return false;
-    }
-
-    SERVER_LOG_DEBUG << "SearchJob " << id() << " add index file: " << index_file->id_;
-
-    index_files_[index_file->id_] = index_file;
-    return true;
+SearchJob::SearchJob(const server::ContextPtr& context, const engine::snapshot::ScopedSnapshotT& snapshot,
+                     engine::DBOptions options, const query::QueryPtr& query_ptr,
+                     const engine::snapshot::IDS_TYPE& segment_ids)
+    : Job(JobType::SEARCH),
+      context_(context),
+      snapshot_(snapshot),
+      options_(options),
+      query_ptr_(query_ptr),
+      segment_ids_(segment_ids) {
 }
 
 void
-SearchJob::WaitResult() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] { return index_files_.empty(); });
-    SERVER_LOG_DEBUG << "SearchJob " << id() << " all done";
-}
-
-void
-SearchJob::SearchDone(size_t index_id) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    index_files_.erase(index_id);
-    if (index_files_.empty()) {
-        cv_.notify_all();
+SearchJob::OnCreateTasks(JobTasks& tasks) {
+    for (auto& id : segment_ids_) {
+        auto task = std::make_shared<SearchTask>(context_, snapshot_, options_, query_ptr_, id, nullptr);
+        task->job_ = this;
+        tasks.emplace_back(task);
     }
-
-    SERVER_LOG_DEBUG << "SearchJob " << id() << " finish index file: " << index_id;
-}
-
-ResultIds&
-SearchJob::GetResultIds() {
-    return result_ids_;
-}
-
-ResultDistances&
-SearchJob::GetResultDistances() {
-    return result_distances_;
-}
-
-Status&
-SearchJob::GetStatus() {
-    return status_;
 }
 
 json
 SearchJob::Dump() const {
     json ret{
-        {"topk", topk_},
-        {"nq", nq_},
-        {"nprobe", nprobe_},
+        {"number_of_search_segment", segment_ids_.size()},
     };
     auto base = Job::Dump();
     ret.insert(base.begin(), base.end());

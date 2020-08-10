@@ -1,129 +1,101 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
-#include "ExecutionEngine.h"
-#include "wrapper/VecIndex.h"
-
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "ExecutionEngine.h"
+#include "db/SnapshotVisitor.h"
+#include "db/snapshot/CompoundOperations.h"
+#include "segment/SegmentReader.h"
 
 namespace milvus {
 namespace engine {
 
 class ExecutionEngineImpl : public ExecutionEngine {
  public:
-    ExecutionEngineImpl(uint16_t dimension, const std::string& location, EngineType index_type, MetricType metric_type,
-                        int32_t nlist);
-
-    ExecutionEngineImpl(VecIndexPtr index, const std::string& location, EngineType index_type, MetricType metric_type,
-                        int32_t nlist);
+    ExecutionEngineImpl(const std::string& dir_root, const SegmentVisitorPtr& segment_visitor);
 
     Status
-    AddWithIds(int64_t n, const float* xdata, const int64_t* xids) override;
-
-    size_t
-    Count() const override;
-
-    size_t
-    Size() const override;
-
-    size_t
-    Dimension() const override;
-
-    size_t
-    PhysicalSize() const override;
+    Load(ExecutionEngineContext& context) override;
 
     Status
-    Serialize() override;
+    CopyToGpu(uint64_t device_id) override;
 
     Status
-    Load(bool to_cache) override;
+    Search(ExecutionEngineContext& context) override;
 
     Status
-    CopyToGpu(uint64_t device_id, bool hybrid = false) override;
-
-    Status
-    CopyToIndexFileToGpu(uint64_t device_id) override;
-
-    Status
-    CopyToCpu() override;
-
-    ExecutionEnginePtr
-    Clone() override;
-
-    Status
-    Merge(const std::string& location) override;
-
-    Status
-    Search(int64_t n, const float* data, int64_t k, int64_t nprobe, float* distances, int64_t* labels,
-           bool hybrid = false) override;
-
-    ExecutionEnginePtr
-    BuildIndex(const std::string& location, EngineType engine_type) override;
-
-    Status
-    Cache() override;
-
-    Status
-    GpuCache(uint64_t gpu_id) override;
-
-    Status
-    Init() override;
-
-    EngineType
-    IndexEngineType() const override {
-        return index_type_;
-    }
-
-    MetricType
-    IndexMetricType() const override {
-        return metric_type_;
-    }
-
-    std::string
-    GetLocation() const override {
-        return location_;
-    }
+    BuildIndex() override;
 
  private:
-    VecIndexPtr
-    CreatetVecIndex(EngineType type);
+    Status
+    VecSearch(ExecutionEngineContext& context, const query::VectorQueryPtr& vector_param,
+              knowhere::VecIndexPtr& vec_index, bool hybrid = false);
 
-    VecIndexPtr
-    Load(const std::string& location);
+    knowhere::VecIndexPtr
+    CreateVecIndex(const std::string& index_name);
 
-    void
-    HybridLoad() const;
+    Status
+    CreateStructuredIndex(const engine::DataType field_type, engine::BinaryDataPtr& raw_data,
+                          knowhere::IndexPtr& index_ptr);
 
-    void
-    HybridUnset() const;
+    Status
+    LoadForSearch(const query::QueryPtr& query_ptr);
 
- protected:
-    VecIndexPtr index_ = nullptr;
-    EngineType index_type_;
-    MetricType metric_type_;
+    Status
+    Load(const TargetFields& field_names);
 
-    int64_t dim_;
-    std::string location_;
+    Status
+    ExecBinaryQuery(const query::GeneralQueryPtr& general_query, faiss::ConcurrentBitsetPtr& bitset,
+                    std::unordered_map<std::string, DataType>& attr_type, std::string& vector_placeholder);
 
-    int32_t nlist_ = 0;
-    int32_t gpu_num_ = 0;
+    Status
+    ProcessTermQuery(faiss::ConcurrentBitsetPtr& bitset, const query::TermQueryPtr& term_query,
+                     std::unordered_map<std::string, DataType>& attr_type);
+
+    Status
+    IndexedTermQuery(faiss::ConcurrentBitsetPtr& bitset, const std::string& field_name, const DataType& data_type,
+                     milvus::json& term_values_json);
+
+    Status
+    ProcessRangeQuery(const std::unordered_map<std::string, DataType>& attr_type, faiss::ConcurrentBitsetPtr& bitset,
+                      const query::RangeQueryPtr& range_query);
+
+    Status
+    IndexedRangeQuery(faiss::ConcurrentBitsetPtr& bitset, const DataType& data_type, knowhere::IndexPtr& index_ptr,
+                      milvus::json& range_values_json);
+
+    using AddSegmentFileOperation = std::shared_ptr<snapshot::ChangeSegmentFileOperation>;
+    Status
+    CreateSnapshotIndexFile(AddSegmentFileOperation& operation, const std::string& field_name,
+                            CollectionIndex& index_info);
+
+    Status
+    BuildKnowhereIndex(const std::string& field_name, const CollectionIndex& index_info,
+                       knowhere::VecIndexPtr& new_index);
+
+ private:
+    segment::SegmentReaderPtr segment_reader_;
+    TargetFields target_fields_;
+    ExecutionEngineContext context_;
+
+    int64_t entity_count_;
+
+    int64_t gpu_num_ = 0;
+    bool gpu_enable_ = false;
 };
 
 }  // namespace engine

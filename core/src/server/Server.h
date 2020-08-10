@@ -1,23 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
 #include <string>
+#include "config/ConfigMgr.h"
 #include "utils/Status.h"
 
 namespace milvus {
@@ -29,8 +24,7 @@ class Server {
     GetInstance();
 
     void
-    Init(int64_t daemonized, const std::string& pid_filename, const std::string& config_filename,
-         const std::string& log_config_file);
+    Init(int64_t daemonized, const std::string& pid_filename, const std::string& config_filename);
 
     Status
     Start();
@@ -47,17 +41,24 @@ class Server {
     Status
     LoadConfig();
 
-    void
+    Status
     StartService();
     void
     StopService();
+
+ private:
+    static void
+    LogConfigInFile(const std::string& path);
+
+    static void
+    LogCpuInfo();
 
  private:
     int64_t daemonized_ = 0;
     int pid_fd_ = -1;
     std::string pid_filename_;
     std::string config_filename_;
-    std::string log_config_file_;
+    // ConfigMgrPtr config_mgr_;
 };  // Server
 
 }  // namespace server

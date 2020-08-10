@@ -1,323 +1,343 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
+#include <grpcpp/server_context.h>
+
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <random>
 #include <string>
+#include <unordered_map>
 
 #include "grpc/gen-milvus/milvus.grpc.pb.h"
 #include "grpc/gen-status/status.pb.h"
+#include "opentracing/tracer.h"
+#include "server/context/Context.h"
+#include "server/delivery/ReqHandler.h"
+#include "server/grpc_impl/interceptor/GrpcInterceptorHookHandler.h"
+#include "src/utils/Status.h"
 
 namespace milvus {
 namespace server {
 namespace grpc {
-class GrpcRequestHandler final : public ::milvus::grpc::MilvusService::Service {
+
+#define CHECK_NULLPTR_RETURN(PTR)  \
+    if (nullptr == request) {      \
+        return ::grpc::Status::OK; \
+    }
+
+#define SET_TRACING_TAG(STATUS, SERVER_CONTEXT)                                                                  \
+    if ((STATUS).code() != ::milvus::grpc::ErrorCode::SUCCESS) {                                                 \
+        GetContext((SERVER_CONTEXT))->GetTraceContext()->GetSpan()->SetTag("error", true);                       \
+        GetContext((SERVER_CONTEXT))->GetTraceContext()->GetSpan()->SetTag("error_message", (STATUS).message()); \
+    }
+
+#define SET_RESPONSE(RESPONSE, STATUS, SERVER_CONTEXT)                      \
+    do {                                                                    \
+        if ((STATUS).ok()) {                                                \
+            (RESPONSE)->set_error_code(::milvus::grpc::ErrorCode::SUCCESS); \
+        } else {                                                            \
+            (RESPONSE)->set_error_code(ErrorMap((STATUS).code()));          \
+        }                                                                   \
+        (RESPONSE)->set_reason((STATUS).message());                         \
+        SET_TRACING_TAG(STATUS, SERVER_CONTEXT);                            \
+    } while (false);
+
+::milvus::grpc::ErrorCode
+ErrorMap(ErrorCode code);
+
+extern const char* EXTRA_PARAM_KEY;
+
+class GrpcRequestHandler final : public ::milvus::grpc::MilvusService::Service, public GrpcInterceptorHookHandler {
  public:
-    /**
-     * @brief Create table method
-     *
-     * This method is used to create table
-     *
-     * @param context, add context for every RPC
-     * @param request, used to provide table information to be created.
-     * @param response, used to get the status
-     *
-     * @return status
-     *
-     * @param request
-     * @param response
-     * @param context
-     */
-    ::grpc::Status
-    CreateTable(::grpc::ServerContext* context, const ::milvus::grpc::TableSchema* request,
-                ::milvus::grpc::Status* response) override;
+    explicit GrpcRequestHandler(const std::shared_ptr<opentracing::Tracer>& tracer);
 
-    /**
-     * @brief Test table existence method
-     *
-     * This method is used to test table existence.
-     *
-     * @param context, add context for every RPC
-     * @param request, table name is going to be tested.
-     * @param response, get the bool reply of hastable
-     *
-     * @return status
-     *
-     * @param request
-     * @param response
-     * @param context
-     */
-    ::grpc::Status
-    HasTable(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-             ::milvus::grpc::BoolReply* response) override;
+    void
+    OnPostRecvInitialMetaData(::grpc::experimental::ServerRpcInfo* server_rpc_info,
+                              ::grpc::experimental::InterceptorBatchMethods* interceptor_batch_methods) override;
 
-    /**
-     * @brief Drop table method
-     *
-     * This method is used to drop table.
-     *
-     * @param context, add context for every RPC
-     * @param request, table name is going to be deleted.
-     * @param response, get the status of droptable
-     *
-     * @return status
-     *
-     * @param request
-     * @param response
-     * @param context
-     */
-    ::grpc::Status
-    DropTable(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-              ::milvus::grpc::Status* response) override;
+    void
+    OnPreSendMessage(::grpc::experimental::ServerRpcInfo* server_rpc_info,
+                     ::grpc::experimental::InterceptorBatchMethods* interceptor_batch_methods) override;
 
-    /**
-     * @brief build index by table method
-     *
-     * This method is used to build index by table in sync.
-     *
-     * @param context, add context for every RPC
-     * @param request, table name is going to be built index.
-     * @param response, get the status of buildindex
-     *
-     * @return status
-     *
-     * @param request
-     * @param response
-     * @param context
-     */
+    std::shared_ptr<Context>
+    GetContext(::grpc::ServerContext* server_context);
+
+    void
+    SetContext(::grpc::ServerContext* server_context, const std::shared_ptr<Context>& context);
+
+    uint64_t
+    random_id() const;
+
+    // *
+    // @brief This method is used to create collection
+    //
+    // @param CollectionSchema, use to provide collection information to be created.
+    //
+    // @return Status
+    ::grpc::Status
+    CreateCollection(::grpc::ServerContext* context, const ::milvus::grpc::Mapping* request,
+                     ::milvus::grpc::Status* response) override;
+    // *
+    // @brief This method is used to test collection existence.
+    //
+    // @param CollectionName, collection name is going to be tested.
+    //
+    // @return BoolReply
+    ::grpc::Status
+    HasCollection(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                  ::milvus::grpc::BoolReply* response) override;
+    // *
+    // @brief This method is used to get collection schema.
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return CollectionSchema
+    ::grpc::Status
+    DescribeCollection(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                       ::milvus::grpc::Mapping* response) override;
+    // *
+    // @brief This method is used to get collection schema.
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return CollectionRowCount
+    ::grpc::Status
+    CountCollection(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                    ::milvus::grpc::CollectionRowCount* response) override;
+    // *
+    // @brief This method is used to list all collections.
+    //
+    // @param Command, dummy parameter.
+    //
+    // @return CollectionNameList
+    ::grpc::Status
+    ShowCollections(::grpc::ServerContext* context, const ::milvus::grpc::Command* request,
+                    ::milvus::grpc::CollectionNameList* response) override;
+    // *
+    // @brief This method is used to get collection detail information.
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return CollectionInfo
+    ::grpc::Status
+    ShowCollectionInfo(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                       ::milvus::grpc::CollectionInfo* response);
+
+    // *
+    // @brief This method is used to delete collection.
+    //
+    // @param CollectionName, collection name is going to be deleted.
+    //
+    // @return CollectionNameList
+    ::grpc::Status
+    DropCollection(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                   ::milvus::grpc::Status* response) override;
+    // *
+    // @brief This method is used to build index by collection in sync mode.
+    //
+    // @param IndexParam, index paramters.
+    //
+    // @return Status
     ::grpc::Status
     CreateIndex(::grpc::ServerContext* context, const ::milvus::grpc::IndexParam* request,
                 ::milvus::grpc::Status* response) override;
+    // *
+    // @brief This method is used to describe index
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return IndexParam
+    ::grpc::Status
+    DescribeIndex(::grpc::ServerContext* context, const ::milvus::grpc::IndexParam* request,
+                  ::milvus::grpc::IndexParam* response) override;
+    // *
+    // @brief This method is used to drop index
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return Status
+    ::grpc::Status
+    DropIndex(::grpc::ServerContext* context, const ::milvus::grpc::IndexParam* request,
+              ::milvus::grpc::Status* response) override;
+    // *
+    // @brief This method is used to create partition
+    //
+    // @param PartitionParam, partition parameters.
+    //
+    // @return Status
+    ::grpc::Status
+    CreatePartition(::grpc::ServerContext* context, const ::milvus::grpc::PartitionParam* request,
+                    ::milvus::grpc::Status* response) override;
 
-    /**
-     * @brief Insert vector array to table
-     *
-     * This method is used to insert vector array to table.
-     *
-     * @param context, add context for every RPC
-     * @param request, table_name is inserted.
-     * @param response, vector array is inserted.
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to test partition existence.
+    //
+    // @param PartitionParam, target partition.
+    //
+    // @return BoolReply
+    ::grpc::Status
+    HasPartition(::grpc::ServerContext* context, const ::milvus::grpc::PartitionParam* request,
+                 ::milvus::grpc::BoolReply* response);
+
+    // *
+    // @brief This method is used to show partition information
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return PartitionList
+    ::grpc::Status
+    ShowPartitions(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                   ::milvus::grpc::PartitionList* response) override;
+    // *
+    // @brief This method is used to drop partition
+    //
+    // @param PartitionName, target partition name.
+    //
+    // @return Status
+    ::grpc::Status
+    DropPartition(::grpc::ServerContext* context, const ::milvus::grpc::PartitionParam* request,
+                  ::milvus::grpc::Status* response) override;
+    // *
+    // @brief This method is used to add vector array to collection.
+    //
+    // @param InsertParam, insert parameters.
+    //
+    // @return VectorIds
     ::grpc::Status
     Insert(::grpc::ServerContext* context, const ::milvus::grpc::InsertParam* request,
-           ::milvus::grpc::VectorIds* response) override;
+           ::milvus::grpc::EntityIds* response) override;
+    // *
+    // @brief This method is used to get vectors data by id array.
+    //
+    // @param VectorsIdentity, target vector id array.
+    //
+    // @return VectorsData
+    ::grpc::Status
+    GetEntityByID(::grpc::ServerContext* context, const ::milvus::grpc::EntityIdentity* request,
+                  ::milvus::grpc::Entities* response) override;
 
-    /**
-     * @brief Query vector
-     *
-     * This method is used to query vector in table.
-     *
-     * @param context, add context for every RPC
-     * @param request:
-     *               table_name, table_name is queried.
-     *               query_record_array, all vector are going to be queried.
-     *               query_range_array, optional ranges for conditional search. If not specified, search whole table
-     *               topk, how many similarity vectors will be searched.
-     *
-     * @param writer, write query result array.
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param writer
-     */
+    // *
+    // @brief This method is used to get vector ids from a segment
+    //
+    // @param GetVectorIDsParam, target collection and segment
+    //
+    // @return VectorIds
+    ::grpc::Status
+    GetEntityIDs(::grpc::ServerContext* context, const ::milvus::grpc::GetEntityIDsParam* request,
+                 ::milvus::grpc::EntityIds* response) override;
+    // *
+    // @brief This method is used to query vector in collection.
+    //
+    // @param SearchParam, search parameters.
+    //
+    // @return TopKQueryResultList
     ::grpc::Status
     Search(::grpc::ServerContext* context, const ::milvus::grpc::SearchParam* request,
-           ::milvus::grpc::TopKQueryResultList* response) override;
+           ::milvus::grpc::QueryResult* response) override;
 
-    /**
-     * @brief Internal use query interface
-     *
-     * This method is used to query vector in specified files.
-     *
-     * @param context, add context for every RPC
-     * @param request:
-     *                file_id_array, specified files id array, queried.
-     *                query_record_array, all vector are going to be queried.
-     *                query_range_array, optional ranges for conditional search. If not specified, search whole table
-     *                topk, how many similarity vectors will be searched.
-     *
-     * @param writer, write query result array.
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param writer
-     */
+    // *
+    // @brief This method is used to query vector in specified files.
+    //
+    // @param SearchInFilesParam, search in files paremeters.
+    //
+    // @return TopKQueryResultList
     ::grpc::Status
-    SearchInFiles(::grpc::ServerContext* context, const ::milvus::grpc::SearchInFilesParam* request,
-                  ::milvus::grpc::TopKQueryResultList* response) override;
+    SearchInSegment(::grpc::ServerContext* context, const ::milvus::grpc::SearchInSegmentParam* request,
+                    ::milvus::grpc::QueryResult* response) override;
 
-    /**
-     * @brief Get table schema
-     *
-     * This method is used to get table schema.
-     *
-     * @param context, add context for every RPC
-     * @param request, target table name.
-     * @param response, table schema
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
-    ::grpc::Status
-    DescribeTable(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-                  ::milvus::grpc::TableSchema* response) override;
-
-    /**
-     * @brief Get table row count
-     *
-     * This method is used to get table row count.
-     *
-     * @param context, add context for every RPC
-     * @param request, target table name.
-     * @param response, table row count
-     *
-     * @return table row count
-     *
-     * @param request
-     * @param response
-     * @param context
-     */
-    ::grpc::Status
-    CountTable(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-               ::milvus::grpc::TableRowCount* response) override;
-
-    /**
-     * @brief List all tables in database
-     *
-     * This method is used to list all tables.
-     *
-     * @param context, add context for every RPC
-     * @param request, show table command, usually not use
-     * @param writer, write tables to client
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param writer
-     */
-    ::grpc::Status
-    ShowTables(::grpc::ServerContext* context, const ::milvus::grpc::Command* request,
-               ::milvus::grpc::TableNameList* response) override;
-
-    /**
-     * @brief Give the server status
-     *
-     *
-     * This method is used to give the server status.
-     * @param context, add context for every RPC
-     * @param request, give server command
-     * @param response, server status
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to give the server status.
+    //
+    // @param Command, command string
+    //
+    // @return StringReply
     ::grpc::Status
     Cmd(::grpc::ServerContext* context, const ::milvus::grpc::Command* request,
         ::milvus::grpc::StringReply* response) override;
 
-    /**
-     * @brief delete table by range
-     *
-     * This method is used to delete table by range.
-     * @param context, add context for every RPC
-     * @param request, table name and range
-     * @param response, status
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to delete vector by id
+    //
+    // @param DeleteByIDParam, delete parameters.
+    //
+    // @return status
     ::grpc::Status
-    DeleteByRange(::grpc::ServerContext* context, const ::milvus::grpc::DeleteByRangeParam* request,
-                  ::milvus::grpc::Status* response) override;
+    DeleteByID(::grpc::ServerContext* context, const ::milvus::grpc::DeleteByIDParam* request,
+               ::milvus::grpc::Status* response) override;
 
-    /**
-     * @brief preload table
-     *
-     * This method is used to preload table.
-     * @param context, add context for every RPC
-     * @param request, table name
-     * @param response, status
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to preload collection
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return Status
     ::grpc::Status
-    PreloadTable(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-                 ::milvus::grpc::Status* response) override;
+    PreloadCollection(::grpc::ServerContext* context, const ::milvus::grpc::CollectionName* request,
+                      ::milvus::grpc::Status* response) override;
 
-    /**
-     * @brief Describe index
-     *
-     * This method is used to describe index.
-     * @param context, add context for every RPC
-     * @param request, table name
-     * @param response, index informations
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to flush buffer into storage.
+    //
+    // @param FlushParam, flush parameters
+    //
+    // @return Status
     ::grpc::Status
-    DescribeIndex(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-                  ::milvus::grpc::IndexParam* response) override;
+    Flush(::grpc::ServerContext* context, const ::milvus::grpc::FlushParam* request,
+          ::milvus::grpc::Status* response) override;
 
-    /**
-     * @brief Drop index
-     *
-     * This method is used to drop index.
-     * @param context, add context for every RPC
-     * @param request, table name
-     * @param response, status
-     *
-     * @return status
-     *
-     * @param context
-     * @param request
-     * @param response
-     */
+    // *
+    // @brief This method is used to compact collection
+    //
+    // @param CollectionName, target collection name.
+    //
+    // @return Status
     ::grpc::Status
-    DropIndex(::grpc::ServerContext* context, const ::milvus::grpc::TableName* request,
-              ::milvus::grpc::Status* response) override;
+    Compact(::grpc::ServerContext* context, ::milvus::grpc::CompactParam* request, ::milvus::grpc::Status* response);
+
+    /*******************************************New Interface*********************************************/
+
+    ::grpc::Status
+    SearchPB(::grpc::ServerContext* context, const ::milvus::grpc::SearchParamPB* request,
+             ::milvus::grpc::QueryResult* response) override;
+
+    void
+    RegisterRequestHandler(const ReqHandler& handler) {
+        req_handler_ = handler;
+    }
+
+    Status
+    DeserializeJsonToBoolQuery(const google::protobuf::RepeatedPtrField<::milvus::grpc::VectorParam>& vector_params,
+                               const std::string& dsl_string, query::BooleanQueryPtr& boolean_query,
+                               query::QueryPtr& query_ptr);
+
+    Status
+    ProcessBooleanQueryJson(const nlohmann::json& query_json, query::BooleanQueryPtr& boolean_query,
+                            query::QueryPtr& query_ptr);
+
+    Status
+    ProcessLeafQueryJson(const nlohmann::json& json, query::BooleanQueryPtr& query, std::string& field_name);
+
+ private:
+    ReqHandler req_handler_;
+
+    std::unordered_map<std::string, std::shared_ptr<Context>> context_map_;
+    std::shared_ptr<opentracing::Tracer> tracer_;
+
+    mutable std::mt19937_64 random_num_generator_;
+    mutable std::mutex random_mutex_;
+    mutable std::mutex context_map_mutex_;
 };
 
 }  // namespace grpc

@@ -1,60 +1,74 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
-#include "Task.h"
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "db/SnapshotVisitor.h"
+#include "db/engine/ExecutionEngine.h"
 #include "scheduler/Definition.h"
 #include "scheduler/job/SearchJob.h"
-
-#include <vector>
+#include "scheduler/task/Task.h"
 
 namespace milvus {
 namespace scheduler {
 
-// TODO(wxyu): rewrite
-class XSearchTask : public Task {
+class SearchTask : public Task {
  public:
-    explicit XSearchTask(TableFileSchemaPtr file, TaskLabelPtr label);
+    explicit SearchTask(const server::ContextPtr& context, engine::snapshot::ScopedSnapshotT snapshot,
+                        const engine::DBOptions& options, const query::QueryPtr& query_ptr,
+                        engine::snapshot::ID_TYPE segment_id, TaskLabelPtr label);
 
-    void
-    Load(LoadType type, uint8_t device_id) override;
+    inline json
+    Dump() const override {
+        json ret{
+            {"type", type_},
+            {"segment_id", segment_id_},
+        };
+        return ret;
+    }
 
-    void
-    Execute() override;
+    Status
+    OnLoad(LoadType type, uint8_t device_id) override;
 
- public:
+    Status
+    OnExecute() override;
+
     static void
-    MergeTopkToResultSet(const scheduler::ResultIds& src_ids, const scheduler::ResultDistances& src_distances,
-                         size_t src_k, size_t nq, size_t topk, bool ascending, scheduler::ResultIds& tar_ids,
-                         scheduler::ResultDistances& tar_distances);
+    MergeTopkToResultSet(const engine::ResultIds& src_ids, const engine::ResultDistances& src_distances, size_t src_k,
+                         size_t nq, size_t topk, bool ascending, engine::QueryResultPtr& result);
 
-    //    static void
-    //    MergeTopkArray(std::vector<int64_t>& tar_ids, std::vector<float>& tar_distance, uint64_t& tar_input_k,
-    //                   const std::vector<int64_t>& src_ids, const std::vector<float>& src_distance, uint64_t
-    //                   src_input_k, uint64_t nq, uint64_t topk, bool ascending);
+    int64_t
+    nq();
+
+ private:
+    void
+    CreateExecEngine();
 
  public:
-    TableFileSchemaPtr file_;
+    const std::shared_ptr<server::Context> context_;
+    engine::snapshot::ScopedSnapshotT snapshot_;
 
-    size_t index_id_ = 0;
-    int index_type_ = 0;
-    ExecutionEnginePtr index_engine_ = nullptr;
-    bool metric_l2 = true;
+    const engine::DBOptions& options_;
+    query::QueryPtr query_ptr_;
+    engine::snapshot::ID_TYPE segment_id_;
+
+    engine::ExecutionEnginePtr execution_engine_;
+
+    // distance -- value 0 means two vectors equal, ascending reduce, L2/HAMMING/JACCARD/TONIMOTO ...
+    // similarity -- infinity value means two vectors equal, descending reduce, IP
+    bool ascending_reduce_ = true;
 };
 
 }  // namespace scheduler

@@ -5,10 +5,8 @@ BUILD_UNITTEST="OFF"
 INSTALL_PREFIX=$(pwd)/cmake_build
 MAKE_CLEAN="OFF"
 PROFILING="OFF"
-BUILD_FAISS_WITH_MKL="OFF"
-USE_JFROG_CACHE="OFF"
 
-while getopts "p:d:t:uhrcgmj" arg
+while getopts "p:d:t:uhrcgm" arg
 do
         case $arg in
              t)
@@ -30,12 +28,6 @@ do
              g)
                 PROFILING="ON"
                 ;;
-             m)
-                BUILD_FAISS_WITH_MKL="ON"
-                ;;
-             j)
-                USE_JFROG_CACHE="ON"
-                ;;
              h) # help
                 echo "
 
@@ -45,10 +37,9 @@ parameter:
 -p: install prefix(default: $(pwd)/knowhere)
 -r: remove previous build directory(default: OFF)
 -g: profiling(default: OFF)
--m: build faiss with MKL(default: OFF)
 
 usage:
-./build.sh -t \${BUILD_TYPE} [-u] [-h] [-g] [-r] [-c] [-m]
+./build.sh -t \${BUILD_TYPE} [-u] [-h] [-g] [-r] [-c]
                 "
                 exit 0
                 ;;
@@ -74,8 +65,6 @@ if [[ ${MAKE_CLEAN} == "ON" ]]; then
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     -DCMAKE_CUDA_COMPILER=${CUDA_COMPILER} \
     -DMILVUS_ENABLE_PROFILING=${PROFILING} \
-    -DBUILD_FAISS_WITH_MKL=${BUILD_FAISS_WITH_MKL} \
-    -DUSE_JFROG_CACHE=${USE_JFROG_CACHE} \
     ../"
     echo ${CMAKE_CMD}
 

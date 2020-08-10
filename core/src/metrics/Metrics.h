@@ -1,24 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
 #include "MetricBase.h"
-#include "db/meta/MetaTypes.h"
+#include "db/Types.h"
 
 namespace milvus {
 namespace server {
@@ -67,7 +61,7 @@ class CollectInsertMetrics : CollectMetricsBase {
         if (n_ > 0) {
             auto total_time = TimeFromBegine();
             double avg_time = total_time / n_;
-            for (int i = 0; i < n_; ++i) {
+            for (size_t i = 0; i < n_; ++i) {
                 Metrics::GetInstance().AddVectorsDurationHistogramOberve(avg_time);
             }
 
@@ -96,7 +90,7 @@ class CollectQueryMetrics : CollectMetricsBase {
     ~CollectQueryMetrics() {
         if (nq_ > 0) {
             auto total_time = TimeFromBegine();
-            for (int i = 0; i < nq_; ++i) {
+            for (size_t i = 0; i < nq_; ++i) {
                 server::Metrics::GetInstance().QueryResponseSummaryObserve(total_time);
             }
             auto average_time = total_time / nq_;
@@ -181,62 +175,6 @@ class CollectAddMetrics : CollectMetricsBase {
  private:
     size_t n_;
     uint16_t dimension_;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-class CollectDurationMetrics : CollectMetricsBase {
- public:
-    explicit CollectDurationMetrics(int index_type) : index_type_(index_type) {
-    }
-
-    ~CollectDurationMetrics() {
-        auto total_time = TimeFromBegine();
-        switch (index_type_) {
-            case engine::meta::TableFileSchema::RAW: {
-                server::Metrics::GetInstance().SearchRawDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-            case engine::meta::TableFileSchema::TO_INDEX: {
-                server::Metrics::GetInstance().SearchRawDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-            default: {
-                server::Metrics::GetInstance().SearchIndexDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-        }
-    }
-
- private:
-    int index_type_;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-class CollectSearchTaskMetrics : CollectMetricsBase {
- public:
-    explicit CollectSearchTaskMetrics(int index_type) : index_type_(index_type) {
-    }
-
-    ~CollectSearchTaskMetrics() {
-        auto total_time = TimeFromBegine();
-        switch (index_type_) {
-            case engine::meta::TableFileSchema::RAW: {
-                server::Metrics::GetInstance().SearchRawDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-            case engine::meta::TableFileSchema::TO_INDEX: {
-                server::Metrics::GetInstance().SearchRawDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-            default: {
-                server::Metrics::GetInstance().SearchIndexDataDurationSecondsHistogramObserve(total_time);
-                break;
-            }
-        }
-    }
-
- private:
-    int index_type_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

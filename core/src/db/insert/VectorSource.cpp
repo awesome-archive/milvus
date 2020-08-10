@@ -1,77 +1,48 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "db/insert/VectorSource.h"
-#include "db/engine/EngineFactory.h"
-#include "db/engine/ExecutionEngine.h"
+
+#include <utility>
+#include <vector>
+
 #include "metrics/Metrics.h"
 #include "utils/Log.h"
+#include "utils/TimeRecorder.h"
 
 namespace milvus {
 namespace engine {
 
-VectorSource::VectorSource(const size_t& n, const float* vectors)
-    : n_(n), vectors_(vectors), id_generator_(std::make_shared<SimpleIDGenerator>()) {
-    current_num_vectors_added = 0;
+VectorSource::VectorSource(const DataChunkPtr& chunk) : chunk_(chunk) {
 }
 
 Status
-VectorSource::Add(const ExecutionEnginePtr& execution_engine, const meta::TableFileSchema& table_file_schema,
-                  const size_t& num_vectors_to_add, size_t& num_vectors_added, IDNumbers& vector_ids) {
-    server::CollectAddMetrics metrics(n_, table_file_schema.dimension_);
+VectorSource::Add(const segment::SegmentWriterPtr& segment_writer_ptr, const int64_t& num_entities_to_add,
+                  int64_t& num_entities_added) {
+    // TODO: n = vectors_.vector_count_;???
+    int64_t n = chunk_->count_;
+    num_entities_added = current_num_added_ + num_entities_to_add <= n ? num_entities_to_add : n - current_num_added_;
 
-    num_vectors_added =
-        current_num_vectors_added + num_vectors_to_add <= n_ ? num_vectors_to_add : n_ - current_num_vectors_added;
-    IDNumbers vector_ids_to_add;
-    if (vector_ids.empty()) {
-        id_generator_->GetNextIDNumbers(num_vectors_added, vector_ids_to_add);
-    } else {
-        vector_ids_to_add.resize(num_vectors_added);
-        for (int pos = current_num_vectors_added; pos < current_num_vectors_added + num_vectors_added; pos++) {
-            vector_ids_to_add[pos - current_num_vectors_added] = vector_ids[pos];
-        }
-    }
-    Status status = execution_engine->AddWithIds(num_vectors_added,
-                                                 vectors_ + current_num_vectors_added * table_file_schema.dimension_,
-                                                 vector_ids_to_add.data());
-    if (status.ok()) {
-        current_num_vectors_added += num_vectors_added;
-        vector_ids_.insert(vector_ids_.end(), std::make_move_iterator(vector_ids_to_add.begin()),
-                           std::make_move_iterator(vector_ids_to_add.end()));
-    } else {
-        ENGINE_LOG_ERROR << "VectorSource::Add failed: " + status.ToString();
+    auto status = segment_writer_ptr->AddChunk(chunk_, current_num_added_, num_entities_added);
+    if (!status.ok()) {
+        return status;
     }
 
+    current_num_added_ += num_entities_added;
     return status;
-}
-
-size_t
-VectorSource::GetNumVectorsAdded() {
-    return current_num_vectors_added;
 }
 
 bool
 VectorSource::AllAdded() {
-    return (current_num_vectors_added == n_);
-}
-
-IDNumbers
-VectorSource::GetVectorIds() {
-    return vector_ids_;
+    return (current_num_added_ >= chunk_->count_);
 }
 
 }  // namespace engine

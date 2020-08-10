@@ -1,36 +1,24 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 #pragma once
 
-#include <condition_variable>
-#include <deque>
-#include <list>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
-#include "ResourceMgr.h"
-#include "interface/interfaces.h"
-#include "job/Job.h"
-#include "task/Task.h"
+#include "scheduler/ResourceMgr.h"
+#include "scheduler/interface/interfaces.h"
+#include "scheduler/job/Job.h"
+#include "scheduler/task/Task.h"
+#include "utils/BlockingQueue.h"
 
 namespace milvus {
 namespace scheduler {
@@ -59,18 +47,13 @@ class JobMgr : public interface::dumpable {
     static std::vector<TaskPtr>
     build_task(const JobPtr& job);
 
-    void
-    calculate_path(const TaskPtr& task);
+ public:
+    static void
+    calculate_path(const ResourceMgrPtr& res_mgr, const TaskPtr& task);
 
  private:
-    bool running_ = false;
-    std::queue<JobPtr> queue_;
-
-    std::thread worker_thread_;
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-
+    BlockingQueue<JobPtr> queue_;
+    std::shared_ptr<std::thread> worker_thread_ = nullptr;
     ResourceMgrPtr res_mgr_ = nullptr;
 };
 

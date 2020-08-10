@@ -1,164 +1,209 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (C) 2019-2020 Zilliz. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #pragma once
 
-#include "DB.h"
-#include "Types.h"
-#include "src/db/insert/MemManager.h"
-#include "utils/ThreadPool.h"
-
 #include <atomic>
-#include <condition_variable>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include "db/DB.h"
+
+#include "config/ConfigMgr.h"
+#include "utils/ThreadPool.h"
+#include "wal/WalManager.h"
 
 namespace milvus {
 namespace engine {
 
-class Env;
-
-namespace meta {
-class Meta;
-}
-
-class DBImpl : public DB {
+class DBImpl : public DB, public ConfigObserver {
  public:
     explicit DBImpl(const DBOptions& options);
+
     ~DBImpl();
 
     Status
-    Start() override;
-    Status
-    Stop() override;
-    Status
-    DropAll() override;
+    Start();
 
     Status
-    CreateTable(meta::TableSchema& table_schema) override;
+    Stop();
 
     Status
-    DeleteTable(const std::string& table_id, const meta::DatesT& dates) override;
+    CreateCollection(const snapshot::CreateCollectionContext& context) override;
 
     Status
-    DescribeTable(meta::TableSchema& table_schema) override;
+    DropCollection(const std::string& name) override;
 
     Status
-    HasTable(const std::string& table_id, bool& has_or_not) override;
+    HasCollection(const std::string& collection_name, bool& has_or_not) override;
 
     Status
-    AllTables(std::vector<meta::TableSchema>& table_schema_array) override;
+    ListCollections(std::vector<std::string>& names) override;
 
     Status
-    PreloadTable(const std::string& table_id) override;
+    GetCollectionInfo(const std::string& collection_name, snapshot::CollectionPtr& collection,
+                      snapshot::FieldElementMappings& fields_schema) override;
 
     Status
-    UpdateTableFlag(const std::string& table_id, int64_t flag);
+    GetCollectionStats(const std::string& collection_name, milvus::json& collection_stats) override;
 
     Status
-    GetTableRowCount(const std::string& table_id, uint64_t& row_count) override;
+    CountEntities(const std::string& collection_name, int64_t& row_count) override;
 
     Status
-    InsertVectors(const std::string& table_id, uint64_t n, const float* vectors, IDNumbers& vector_ids) override;
+    CreatePartition(const std::string& collection_name, const std::string& partition_name) override;
 
     Status
-    CreateIndex(const std::string& table_id, const TableIndex& index) override;
+    DropPartition(const std::string& collection_name, const std::string& partition_name) override;
 
     Status
-    DescribeIndex(const std::string& table_id, TableIndex& index) override;
+    HasPartition(const std::string& collection_name, const std::string& partition_tag, bool& exist) override;
 
     Status
-    DropIndex(const std::string& table_id) override;
+    ListPartitions(const std::string& collection_name, std::vector<std::string>& partition_names) override;
 
     Status
-    Query(const std::string& table_id, uint64_t k, uint64_t nq, uint64_t nprobe, const float* vectors,
-          ResultIds& result_ids, ResultDistances& result_distances) override;
+    CreateIndex(const std::shared_ptr<server::Context>& context, const std::string& collection_name,
+                const std::string& field_name, const CollectionIndex& index) override;
 
     Status
-    Query(const std::string& table_id, uint64_t k, uint64_t nq, uint64_t nprobe, const float* vectors,
-          const meta::DatesT& dates, ResultIds& result_ids, ResultDistances& result_distances) override;
+    DropIndex(const std::string& collection_name, const std::string& field_name = "") override;
 
     Status
-    Query(const std::string& table_id, const std::vector<std::string>& file_ids, uint64_t k, uint64_t nq,
-          uint64_t nprobe, const float* vectors, const meta::DatesT& dates, ResultIds& result_ids,
-          ResultDistances& result_distances) override;
+    DescribeIndex(const std::string& collection_name, const std::string& field_name, CollectionIndex& index) override;
 
     Status
-    Size(uint64_t& result) override;
+    Insert(const std::string& collection_name, const std::string& partition_name, DataChunkPtr& data_chunk) override;
+
+    Status
+    GetEntityByID(const std::string& collection_name, const IDNumbers& id_array,
+                  const std::vector<std::string>& field_names, std::vector<bool>& valid_row,
+                  DataChunkPtr& data_chunk) override;
+
+    Status
+    DeleteEntityByID(const std::string& collection_name, const engine::IDNumbers& entity_ids) override;
+
+    Status
+    Query(const server::ContextPtr& context, const query::QueryPtr& query_ptr, engine::QueryResultPtr& result) override;
+
+    Status
+    ListIDInSegment(const std::string& collection_name, int64_t segment_id, IDNumbers& entity_ids) override;
+
+    Status
+    LoadCollection(const server::ContextPtr& context, const std::string& collection_name,
+                   const std::vector<std::string>& field_names, bool force = false) override;
+
+    Status
+    Flush(const std::string& collection_name) override;
+
+    Status
+    Flush() override;
+
+    Status
+    Compact(const server::ContextPtr& context, const std::string& collection_name, double threshold = 0.0) override;
+
+    void
+    ConfigUpdate(const std::string& name) override;
 
  private:
-    Status
-    QueryAsync(const std::string& table_id, const meta::TableFilesSchema& files, uint64_t k, uint64_t nq,
-               uint64_t nprobe, const float* vectors, ResultIds& result_ids, ResultDistances& result_distances);
+    void
+    InternalFlush(const std::string& collection_name = "");
 
     void
-    BackgroundTimerTask();
-    void
-    WaitMergeFileFinish();
-    void
-    WaitBuildIndexFinish();
+    TimingFlushThread();
 
     void
     StartMetricTask();
 
     void
-    StartCompactionTask();
-    Status
-    MergeFiles(const std::string& table_id, const meta::DateT& date, const meta::TableFilesSchema& files);
-    Status
-    BackgroundMergeFiles(const std::string& table_id);
-    void
-    BackgroundCompaction(std::set<std::string> table_ids);
+    TimingMetricThread();
 
     void
-    StartBuildIndexTask(bool force = false);
+    StartBuildIndexTask(const std::vector<std::string>& collection_names);
+
     void
-    BackgroundBuildIndex();
+    BackgroundBuildIndexTask(std::vector<std::string> collection_names);
+
+    void
+    TimingIndexThread();
+
+    void
+    WaitBuildIndexFinish();
+
+    void
+    TimingWalThread();
 
     Status
-    MemSerialize();
+    ExecWalRecord(const wal::MXLogRecord& record);
+
+    void
+    StartMergeTask(const std::set<std::string>& collection_names, bool force_merge_all = false);
+
+    void
+    BackgroundMerge(std::set<std::string> collection_names, bool force_merge_all);
+
+    void
+    WaitMergeFileFinish();
+
+    void
+    SuspendIfFirst();
+
+    void
+    ResumeIfLast();
 
  private:
-    const DBOptions options_;
+    DBOptions options_;
+    std::atomic<bool> initialized_;
 
-    std::atomic<bool> shutting_down_;
-
-    std::thread bg_timer_thread_;
-
-    meta::MetaPtr meta_ptr_;
     MemManagerPtr mem_mgr_;
-    std::mutex mem_serialize_mutex_;
+    MergeManagerPtr merge_mgr_ptr_;
 
-    ThreadPool compact_thread_pool_;
-    std::mutex compact_result_mutex_;
-    std::list<std::future<void>> compact_thread_results_;
-    std::set<std::string> compact_table_ids_;
+    //    std::shared_ptr<wal::WalManager> wal_mgr_;
+    std::thread bg_wal_thread_;
+
+    std::thread bg_flush_thread_;
+    std::thread bg_metric_thread_;
+    std::thread bg_index_thread_;
+
+    SimpleWaitNotify swn_wal_;
+    SimpleWaitNotify swn_flush_;
+    SimpleWaitNotify swn_metric_;
+    SimpleWaitNotify swn_index_;
+
+    SimpleWaitNotify flush_req_swn_;
+    SimpleWaitNotify index_req_swn_;
+
+    ThreadPool merge_thread_pool_;
+    std::mutex merge_result_mutex_;
+    std::list<std::future<void>> merge_thread_results_;
 
     ThreadPool index_thread_pool_;
     std::mutex index_result_mutex_;
     std::list<std::future<void>> index_thread_results_;
 
     std::mutex build_index_mutex_;
-};  // DBImpl
+
+    std::mutex flush_merge_compact_mutex_;
+
+    int64_t live_search_num_ = 0;
+    std::mutex suspend_build_mutex_;
+};  // SSDBImpl
+
+using DBImplPtr = std::shared_ptr<DBImpl>;
 
 }  // namespace engine
 }  // namespace milvus

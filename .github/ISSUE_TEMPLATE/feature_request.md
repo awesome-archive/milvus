@@ -1,20 +1,21 @@
 ---
 name: "\U0001F680 Feature request"
-about: Suggest an idea for Milvus
-title: "[FEATURE]"
-labels: ''
+about: As a user, I want to request a feature for Milvus
+title: ''
+labels: kind/feature
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. E.g. I wish I could use Milvus to do [...]
+<!-- Please state your issue using the following template and, most importantly, in English. -->
+#### Is your feature request related to a problem? Please describe:
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+#### Describe the solution you'd like:
 
-**Additional context**
-Add any other context, code examples, or references to existing implementations about the feature request here.
+
+#### Describe alternatives you've considered:
+
+
+#### Additional context:
+
